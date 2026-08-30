@@ -785,6 +785,44 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
 
+### Videos longer than 15 seconds (sliding window)
+
+Outputs longer than the native 4–15 s contract are produced by server-side
+sliding-window generation: every window is denoised inside the native contract
+and the tail of the previous window (video and audio) conditions the next
+window as a frozen `video_audio` history block. The regenerated overlap is
+dropped on concatenation, so the final MP4 is a hard cut at the join. Set
+`duration > 15` in `extra_params` (windowing auto-activates) or pass
+`extra_params.num_segments` explicitly:
+
+```bash
+curl -X POST http://localhost:8000/v1/videos/sync \
+  -F 'model=MiniMaxAI/MiniMax-H3' \
+  -F 'prompt="A drone shot over a coastal cliff at sunrise"' \
+  -F 'extra_params={"task":"t2va","duration":30,"audio_flow_shift":3.0}' \
+  --output cliff_30s.mp4
+```
+
+Windowing keys (all optional, passed in `extra_params` or
+`extra_params.target`):
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `num_segments` | unset | `int >= 2` to fix the window count, or `"auto"` to derive it from `duration` (also the default when `duration > 15`) |
+| `overlap_frames` | `18` | Snapped to the `17n+1` grid (1, 18, 35, …); must be smaller than the window |
+| `window_duration` | `15.0` | Per-window duration in seconds; must be in `[4, 15]` |
+
+Geometry: a 15 s window is 362 frames (the native ceiling). Each continuation
+window contributes `window_num_frames - overlap` new frames (the overlap region
+is regenerated for continuity and then dropped), so two windows yield 706 frames
+(~29.4 s), three yield 1050 (~43.8 s), four yield 1394 (~58.1 s). The default
+`overlap_frames` of 18 is both the conditioning history size and the
+deduplication count. The actual output duration may differ slightly from the
+requested `duration` because it is quantized to the window grid.
+Sliding-window generation runs in request mode and is not available under
+`--step-execution` or `--streaming-output`; incremental per-window streaming is
+planned as a follow-up.
+
 ## Request-scoped quality
 
 Add one of these fields to any HTTP request above. No Cache-DiT startup option
@@ -924,7 +962,10 @@ differ from each other.
 | `quality` | omitted or `lossless` | Request-level quality intent; `high` dynamically installs H3's conservative Cache-DiT profile |
 | `extra_params.force_refresh_step_hint` | omitted | Optional positive 1-based denoising-step hint for an active Cache-DiT request; pair with `extra_params.force_refresh_step_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
-| `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
+| `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count. Values > 15 trigger sliding-window generation |
+| `num_segments` | unset | `int >= 2` or `"auto"` in `extra_params`; controls the sliding-window count for videos longer than 15 s |
+| `overlap_frames` | `18` | Sliding-window overlap in `extra_params`; snapped to the `17n+1` grid |
+| `window_duration` | `15.0` | Per-window duration in seconds for sliding-window generation; must be in `[4, 15]` |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
 | `flow_shift` | `12` | Video sigma shift |

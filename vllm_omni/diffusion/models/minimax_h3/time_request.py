@@ -16,6 +16,22 @@ def _align_frame_count(frame_count: int) -> int:
     return current
 
 
+def _align_overlap_frames(overlap_frames: int) -> int:
+    """Snap overlap to the MiniMax H3 17n+1 frame grid (1, 18, 35, ...).
+
+    The overlap must land on the 17n+1 grid so that, after dropping the
+    regenerated overlap frames of every continuation window, the surviving
+    tail aligns to the same 17n+5 / 5n+2 latent boundary as a fresh window.
+    """
+    if overlap_frames <= 1:
+        return 1
+    current = int(overlap_frames)
+    n = max(0, (current - 1) // 17)
+    lo = 17 * n + 1
+    hi = 17 * (n + 1) + 1
+    return lo if abs(current - lo) <= abs(hi - current) else hi
+
+
 def _video_latent_t(frame_count: int) -> int:
     if frame_count <= 5:
         return 2
@@ -83,6 +99,9 @@ class MiniMaxH3ShapePlanner:
     def align_frame_count(self, frame_count: int) -> int:
         return _align_frame_count(frame_count)
 
+    def align_overlap_frames(self, overlap_frames: int) -> int:
+        return _align_overlap_frames(overlap_frames)
+
     def video_latent_t(self, frame_count: int) -> int:
         return _video_latent_t(frame_count)
 
@@ -111,6 +130,10 @@ MINIMAX_H3_SHAPE_PLANNER = MiniMaxH3ShapePlanner()
 
 def minimax_h3_align_frame_count(frame_count: int) -> int:
     return MINIMAX_H3_SHAPE_PLANNER.align_frame_count(frame_count)
+
+
+def minimax_h3_align_overlap_frames(overlap_frames: int) -> int:
+    return MINIMAX_H3_SHAPE_PLANNER.align_overlap_frames(overlap_frames)
 
 
 def minimax_h3_frame_count_from_video_latent_t(out_t: int) -> int:
