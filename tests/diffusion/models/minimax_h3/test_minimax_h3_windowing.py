@@ -11,22 +11,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 # --------------------------------------------------------------------------- #
 # Overlap / window frame math
 # --------------------------------------------------------------------------- #
-def test_align_overlap_frames_snaps_to_17n_plus_1_grid():
+def _frames_from_latent_t(out_t: int) -> int:
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
-        minimax_h3_align_overlap_frames,
+        MINIMAX_H3_SHAPE_PLANNER,
     )
 
-    # 18 is already on the 17n+1 grid (17*1 + 1).
-    assert minimax_h3_align_overlap_frames(18) == 18
-    # 1 is the minimum (17*0 + 1).
-    assert minimax_h3_align_overlap_frames(1) == 1
-    assert minimax_h3_align_overlap_frames(0) == 1
-    # 35 = 17*2 + 1.
-    assert minimax_h3_align_overlap_frames(35) == 35
-    # 19 snaps to the nearest of {18, 35} -> 18.
-    assert minimax_h3_align_overlap_frames(19) == 18
-    # 30 snaps to the nearest of {18, 35} -> 35.
-    assert minimax_h3_align_overlap_frames(30) == 35
+    return MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(out_t)
 
 
 def test_windowing_plan_30s_is_two_windows_with_overlap_drop():
@@ -45,15 +35,77 @@ def test_windowing_plan_30s_is_two_windows_with_overlap_drop():
     assert plan.is_active
     # Default window is the native ceiling (15 s -> 362 frames = 17*21 + 5).
     assert plan.window_num_frames == 362
-    # Default overlap 18 frames (on the 17n+1 grid).
-    assert plan.overlap_frames == 18
+    # Default overlap is 58 frames -> 17 latents. The overlap lives on the
+    # latent grid: overlap_latent_t must satisfy
+    # (wt - overlap_latent_t) % 15 == 0 so the concatenated latent stays on
+    # the VAE's 5n+2 grid AND each continuation window contributes an
+    # integral number of frames and audio latents.
+    assert plan.overlap_latent_t == 17
+    assert plan.overlap_frames == 58
+    # Audio overlap is derived from the same wall-clock span as the video
+    # contribution, not converted independently from overlap_frames.
+    assert plan.overlap_audio_t == 93
     # 30 s rounds to two windows.
     assert plan.num_windows == 2
-    # Window 0 contributes all 362 frames; window 1 contributes
-    # 362 - 18 = 344 new frames (overlap is regenerated then dropped).
-    assert plan.total_num_frames == 362 + (362 - 18)
-    assert plan.overlap_latent_t == _video_latent_t(18)
-    assert plan.overlap_audio_t == _audio_latent_t(18 / 24)
+    # total_num_frames is what the concatenated latent actually decodes to:
+    # frames(107 + 90) = 668 = 362 + 306.
+    assert plan.total_num_frames == 668
+
+
+def test_windowing_contribution_is_av_exact():
+    """Every continuation window must add the same wall-clock span of video
+    and audio, or the A/V desync accumulates per window."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_windowing,
+    )
+
+    for window_duration in (8.0, 12.0, 15.0):
+        plan = _resolve_minimax_h3_windowing(
+            duration=45.0,
+            fps=24,
+            num_segments=3,
+            overlap_frames=None,
+            window_duration=window_duration,
+        )
+        wt = _video_latent_t(plan.window_num_frames)
+        contributed_frames = _frames_from_latent_t(wt + (wt - plan.overlap_latent_t)) - plan.window_num_frames
+        video_seconds = contributed_frames / 24.0
+        audio_seconds = (plan.window_audio_t - plan.overlap_audio_t) / 40.0
+        assert video_seconds == audio_seconds, window_duration
+        # And the plan's total matches what the latent decodes to.
+        total_t = wt + (plan.num_windows - 1) * (wt - plan.overlap_latent_t)
+        assert plan.total_num_frames == _frames_from_latent_t(total_t)
+
+
+def test_windowing_overlap_snaps_to_latent_grid():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_minimax_h3_windowing,
+    )
+
+    # 100 requested frames -> 27 latents, which is off the wt=107 grid
+    # (27 % 15 != 107 % 15); nearest valid is 32.
+    plan = _resolve_minimax_h3_windowing(
+        duration=30.0,
+        fps=24,
+        num_segments=2,
+        overlap_frames=100,
+        window_duration=None,
+    )
+    assert plan.overlap_latent_t == 32
+    # An 8 s window (192 frames, wt=57) needs overlap_latent_t ≡ 57
+    # (mod 15) = 12; the default 58-frame request (17 latents) snaps down
+    # to 12.
+    plan = _resolve_minimax_h3_windowing(
+        duration=20.0,
+        fps=24,
+        num_segments=2,
+        overlap_frames=None,
+        window_duration=8.0,
+    )
+    assert plan.window_num_frames == 192
+    assert plan.overlap_latent_t == 12
+    assert plan.overlap_audio_t == 65
+    assert plan.total_num_frames == 192 + 153
 
 
 def test_windowing_explicit_num_segments():
@@ -65,12 +117,13 @@ def test_windowing_explicit_num_segments():
         duration=45.0,
         fps=24,
         num_segments=3,
-        overlap_frames=18,
+        overlap_frames=58,
         window_duration=None,
     )
     assert plan.num_windows == 3
-    # Window 0 contributes 362; windows 1-2 each contribute 362 - 18 = 344.
-    assert plan.total_num_frames == 362 + 2 * (362 - 18)
+    # Window 0 contributes 362; windows 1-2 each contribute 306 frames
+    # (90 latents); frames(107 + 180) = 974.
+    assert plan.total_num_frames == 974
 
 
 def test_windowing_inactive_for_single_window():
@@ -143,10 +196,10 @@ def test_history_video_audio_block_emits_frozen_rows():
     )
 
     latent_h, latent_w = 48, 80  # 768x1280-ish canvas at /16
-    overlap_latent_t = 2
-    overlap_audio_t = 30
+    overlap_latent_t = 17
+    overlap_audio_t = 93
     window_latent_t = 107
-    window_audio_t = 602
+    window_audio_t = 603
     history_block = {
         "kind": "video_audio",
         "ref_audio_t": overlap_audio_t,
@@ -186,7 +239,7 @@ def test_audio_history_rows_round_trip_through_latent_tail():
     )
 
     audio_latent = torch.arange(2 * 32 * 602).reshape(2, 32, 602).float()
-    overlap_audio_t = 30
+    overlap_audio_t = 93
     tail = audio_latent[:, :, -overlap_audio_t:]
     rows = minimax_h3_pack_audio_latent(tail)
     assert rows.shape == (overlap_audio_t * 2, 32)
@@ -201,7 +254,7 @@ def test_video_history_rows_round_trip_through_latent_tail():
     )
 
     latent = torch.arange(1 * 24 * 107 * 48 * 80).reshape(1, 24, 107, 48, 80).float()
-    overlap_latent_t = 2
+    overlap_latent_t = 17
     tail = latent[:, :, -overlap_latent_t:, :, :]
     rows = minimax_h3_patchify_video_latent(tail, patch_size=(1, 2, 2))
     frame_rows = (48 // 2) * (80 // 2)
@@ -217,7 +270,8 @@ def test_identity_anchor_plus_history_block_frozen_row_split():
 
     Mirrors the ref_blocks the window loop assembles for a t2va/fl2va
     continuation window: a 1-frame image anchor (window 0's first frame)
-    followed by the multi-frame video+audio history, then the target.
+    followed by the video+audio history block (17 latents / 93 audio latents
+    for the default 15 s window), then the target.
     """
     from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
         minimax_h3_packed_sequence_ref2va_blocks,
@@ -227,8 +281,8 @@ def test_identity_anchor_plus_history_block_frozen_row_split():
     frame_rows = (latent_h // 2) * (latent_w // 2)
     window_latent_t = 107
     window_audio_t = 603
-    overlap_latent_t = 2
-    overlap_audio_t = 30
+    overlap_latent_t = 17
+    overlap_audio_t = 93
     ref_blocks = [
         {"kind": "image", "latent_h": latent_h, "latent_w": latent_w},
         {

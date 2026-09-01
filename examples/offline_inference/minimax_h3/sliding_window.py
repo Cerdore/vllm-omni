@@ -60,7 +60,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="int >= 2 or 'auto'; defaults to 'auto' when duration > 15",
     )
-    parser.add_argument("--overlap-frames", type=int, default=18)
+    parser.add_argument(
+        "--overlap-frames",
+        type=int,
+        default=None,
+        help="Overlap request in frames; unset uses the server default (58)",
+    )
     parser.add_argument("--window-duration", type=float, default=15.0)
     parser.add_argument("--width", type=int, default=1344)
     parser.add_argument("--height", type=int, default=768)
@@ -107,11 +112,12 @@ def sampling_params(engine: AsyncOmni, args: argparse.Namespace) -> list[Any]:
         "aspect_ratio": "16:9",
         "flow_shift": 12.0,
         "audio_flow_shift": 3.0,
-        "overlap_frames": args.overlap_frames,
         "window_duration": args.window_duration,
     }
     if args.num_segments is not None:
         extra_args["num_segments"] = args.num_segments
+    if args.overlap_frames is not None:
+        extra_args["overlap_frames"] = args.overlap_frames
     diffusion.extra_args = extra_args
     return params
 

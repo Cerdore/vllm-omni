@@ -146,7 +146,6 @@ from .scheduling_minimax_h3_euler_ancestral import (
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
-    minimax_h3_align_overlap_frames,
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
@@ -186,7 +185,10 @@ MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
 # Sliding-window defaults. The window stays inside the native 4-15 s contract;
 # longer outputs chain several windows with overlap conditioning.
 MINIMAX_H3_DEFAULT_WINDOW_SECONDS = MINIMAX_H3_MAX_OUTPUT_SECONDS
-MINIMAX_H3_DEFAULT_OVERLAP_FRAMES = 18
+# Default overlap request in frames; resolves to 17 latents (~2.4 s of pinned
+# context) for the default 15 s window via the latent-grid snap in
+# _resolve_minimax_h3_windowing.
+MINIMAX_H3_DEFAULT_OVERLAP_FRAMES = 58
 
 
 @dataclass
@@ -256,37 +258,55 @@ def _resolve_minimax_h3_windowing(
     window_latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(window_num_frames)
     window_audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(window_num_frames / fps)
 
-    overlap = minimax_h3_align_overlap_frames(
-        int(overlap_frames) if overlap_frames is not None else MINIMAX_H3_DEFAULT_OVERLAP_FRAMES
-    )
-    if overlap >= window_num_frames:
+    # The overlap lives on the latent grid. The causal video VAE maps
+    # 17k+5 frames to 5k+2 latents and audio latents are 40/s, so a
+    # continuation window contributes an integral number of frames AND an
+    # integral number of audio latents exactly when
+    # (window_latent_t - overlap_latent_t) % 15 == 0; anything else either
+    # falls off the VAE's 5n+2 grid or accumulates A/V desync per window.
+    requested = int(overlap_frames) if overlap_frames is not None else MINIMAX_H3_DEFAULT_OVERLAP_FRAMES
+    if requested >= window_num_frames:
         raise OmniClientError(
-            f"MiniMax H3 overlap_frames {overlap} must be smaller than the window {window_num_frames} frames"
+            f"MiniMax H3 overlap_frames {requested} must be smaller than the window {window_num_frames} frames"
         )
-    overlap_latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(overlap)
-    overlap_audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(overlap / fps)
+    overlap_raw = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(max(requested, 1))
+    residue = window_latent_t % 15
+    lowest_valid = residue if residue >= 2 else residue + 15
+    overlap_latent_t = residue + 15 * round((overlap_raw - residue) / 15)
+    overlap_latent_t = min(max(overlap_latent_t, lowest_valid), window_latent_t - 15)
+    contributed_latent_t = window_latent_t - overlap_latent_t
+    contributed_frames = (
+        MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(window_latent_t + contributed_latent_t)
+        - window_num_frames
+    )
+    # The audio overlap covers the same wall-clock span as the video overlap:
+    # contributed_frames is a multiple of 3, so this is integral.
+    overlap_audio_t = window_audio_t - contributed_frames * 5 // 3
+    # Steady-state span of the pinned latents, reported for observability.
+    overlap_frames_effective = round(overlap_latent_t * 17 / 5)
 
     if auto:
         # Window 0 contributes window_num_frames; each continuation window
-        # contributes (window_num_frames - overlap) new frames because the
-        # overlap region is regenerated for continuity and then dropped.
-        new_frames_per_window = window_num_frames - overlap
-        window_duration_actual = window_num_frames / fps
-        first_window_duration = window_duration_actual
-        continuation_duration = new_frames_per_window / fps
+        # contributes contributed_frames because the overlap region is
+        # regenerated for continuity and then dropped.
+        first_window_duration = window_num_frames / fps
+        continuation_duration = contributed_frames / fps
         target_extra = max(0.0, float(duration) - first_window_duration)
         num_windows = 1 + int(round(target_extra / continuation_duration))
         num_windows = max(2, num_windows)
     else:
         num_windows = int(num_segments)
 
-    total_num_frames = window_num_frames + (num_windows - 1) * (window_num_frames - overlap)
+    # What the concatenated latent actually decodes to.
+    total_num_frames = MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(
+        window_latent_t + (num_windows - 1) * contributed_latent_t
+    )
     return MiniMaxH3WindowingPlan(
         num_windows=num_windows,
         window_num_frames=window_num_frames,
         window_latent_t=window_latent_t,
         window_audio_t=window_audio_t,
-        overlap_frames=overlap,
+        overlap_frames=overlap_frames_effective,
         overlap_latent_t=overlap_latent_t,
         overlap_audio_t=overlap_audio_t,
         total_num_frames=total_num_frames,
