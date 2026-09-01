@@ -186,26 +186,27 @@ MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
 # Sliding-window defaults. The window stays inside the native 4-15 s contract;
 # longer outputs chain several windows with overlap conditioning.
 MINIMAX_H3_DEFAULT_WINDOW_SECONDS = MINIMAX_H3_MAX_OUTPUT_SECONDS
-# Default overlap request in frames; resolves to 17 latents (~2.4 s of pinned
-# context) for the default 15 s window via the latent-grid snap in
-# _resolve_minimax_h3_windowing.
-# A continuation window is anchored by ONE still (its frame 0 = the previous
-# window's handoff frame), so the overlap only needs the smallest latent-grid
-# span: 2 latents = 5 frames = 200 ms of pinned audio.
-MINIMAX_H3_DEFAULT_OVERLAP_FRAMES = 5
+# Default overlap request in frames: the span both neighbouring windows render
+# and that the next window is spliced into (its first latents held on the
+# previous tail, a short cross-fade, then its own rendering). Snaps to 17
+# latents = 56 frames = 2.3 s for the default 15 s window via the latent-grid
+# snap in _resolve_minimax_h3_windowing.
+MINIMAX_H3_DEFAULT_OVERLAP_FRAMES = 58
 
 
 @dataclass
 class MiniMaxH3WindowingPlan:
     """Per-request sliding-window plan.
 
-    Each window is generated inside the native 4-15 s contract. Continuation
-    windows inject the previous window's tail latent (``overlap_frames`` worth)
-    into the target's initial noise so the denoiser starts from a continuous
-    point; the regenerated overlap frames are dropped after denoise and only
-    the new tail is concatenated. A frozen ``video_audio`` history block also
-    conditions the transformer via attention. ``is_active`` is False for
-    single-window requests so the legacy path is untouched.
+    Each window is generated inside the native 4-15 s contract and overlaps
+    its predecessor by ``overlap_latent_t`` video latents (``overlap_frames``
+    decoded frames, ``overlap_audio_t`` audio latents), the span both windows
+    render and that the later one is spliced into on concatenation.
+    t2va/fl2va continuation windows hold the span's first latents on the
+    previous tail while denoising and anchor on a still of the handoff frame;
+    ref2va windows carry the tail as a frozen ``video_audio`` history block.
+    ``is_active`` is False for single-window requests so the legacy path is
+    untouched.
     """
 
     num_windows: int
@@ -276,8 +277,11 @@ def _resolve_minimax_h3_windowing(
     overlap_raw = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(max(requested, 1))
     residue = window_latent_t % 15
     lowest_valid = residue if residue >= 2 else residue + 15
+    # A continuation window must contribute at least the span it is spliced
+    # into, so the overlap is capped at half the window.
+    highest_valid = residue + 15 * ((window_latent_t // 2 - residue) // 15)
     overlap_latent_t = residue + 15 * round((overlap_raw - residue) / 15)
-    overlap_latent_t = min(max(overlap_latent_t, lowest_valid), window_latent_t - 15)
+    overlap_latent_t = min(max(overlap_latent_t, lowest_valid), highest_valid)
     contributed_latent_t = window_latent_t - overlap_latent_t
     contributed_frames = (
         MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(window_latent_t + contributed_latent_t)
@@ -360,51 +364,199 @@ def _continuation_keyframes(window_keyframes: list[int] | None) -> list[int]:
 
 
 def _window_trim(windowing: MiniMaxH3WindowingPlan, *, sample_rate: int) -> tuple[int, int]:
-    """Decoded frames and audio samples to drop from the head of a continuation window.
+    """Decoded frames and audio samples a continuation window shares with its predecessor.
 
-    A continuation window is decoded in full so the causal VAE sees the real
-    preceding context; its leading ``overlap_latent_t`` latents reproduce the
-    previous window's tail and are dropped after decoding, together with the
-    matching audio span.
+    A continuation window is decoded in full; its leading ``overlap_latent_t``
+    latents render the same span as the previous window's tail (the first of
+    them held on it), so that span is spliced into the previous part and
+    dropped from this window, together with the matching audio span.
     """
     trim_frames = MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(windowing.overlap_latent_t)
     samples_per_audio_latent = sample_rate // MINIMAX_H3_AUDIO_LATENT_HZ
     return trim_frames, windowing.overlap_audio_t * samples_per_audio_latent
 
 
-def _pin_overlap_audio_rows(
+# The two windows' renderings of the shared span diverge with time, so the
+# hand-over is a short cross-fade right after the held frames, where they are
+# still close; a long fade doubles edges and audio events.
+MINIMAX_H3_CROSSFADE_SECONDS = 0.5
+
+# How many of the overlap's leading video latents a continuation window holds
+# on the previous window's tail while denoising: enough to carry velocity into
+# the window (2 latents = 5 frames), but short, so the boundary between held
+# and generated latents falls where the cross-fade still weights the previous
+# window almost fully and any mismatch there is invisible.
+MINIMAX_H3_HISTORY_HOLD_LATENTS = 2
+
+# Sigma below which the held history is released to the denoiser so the last
+# low-noise steps can harmonize it with the generated latents around it.
+MINIMAX_H3_HISTORY_RELEASE_SIGMA = 0.3
+
+# Audio held the same way, in seconds of the previous window's tail (40 audio
+# latents per second); a freshly started window's audio otherwise fades in
+# from near silence, which is audible as the ambience dropping out.
+MINIMAX_H3_AUDIO_HOLD_SECONDS = 0.5
+
+
+def _history_reinjection(
     inputs: dict[str, Any],
     *,
-    overlap_audio_rows: torch.Tensor,
-    overlap_audio_steps: int,
-) -> None:
-    """Freeze the first ``overlap_audio_steps`` target audio rows to the previous tail.
+    history_rows: torch.Tensor,
+    sigmas_video: Sequence[float],
+    on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None,
+    release_sigma: float = MINIMAX_H3_HISTORY_RELEASE_SIGMA,
+    audio_history_rows: torch.Tensor | None = None,
+    sigmas_audio: Sequence[float] | None = None,
+) -> Callable[[int, torch.Tensor, torch.Tensor], None]:
+    """Hold a window's leading target rows on the previous window's tail while noise is high.
 
-    The FL2VA DiT has no trained audio-reference channel, so audio continuity
-    across a join relies on pinning the target's leading audio rows to the
-    previous window's clean tail (``AUDIO_REF_COND_TIMESTEP`` is 1.0, so the
-    anchor is the clean latent). Video continuity goes through keyframe cond
-    tokens instead; see :meth:`MiniMaxH3Pipeline._generate_windowed`.
+    After every step that ends at ``sigma >= release_sigma`` the first
+    ``len(history_rows)`` target video rows are reset to the tail re-noised to
+    that sigma, ``(1 - sigma) * tail + sigma * noise`` with the window's own
+    initial noise. To the DiT they are ordinary target rows at the current
+    noise level, so the rest of the window is generated as their continuation
+    and inherits the motion and exposure the still keyframe alone cannot
+    carry. Below ``release_sigma`` the rows are left to the denoiser. Audio
+    (channel-major rows, so the leading steps of both channel blocks) is held
+    the same way when ``audio_history_rows`` is given; unlike a frozen pin at
+    the reference timestep, held rows never read as a reference clip.
     """
     branch = inputs["branch"]
-    device = branch.audio_update_mask_dev.device
-    audio_update_mask = branch.audio_update_mask_dev
-    audio_target_indices = torch.nonzero(audio_update_mask, as_tuple=False).squeeze(-1)
-    # Audio rows are packed channel-major ([ch0 t0..T, ch1 t0..T]), so the
-    # first ``overlap_audio_steps`` steps are the leading rows of EACH channel
-    # block, and the anchor (also channel-major) lines up with the frozen rows'
-    # ascending order.
-    steps_per_channel = int(audio_target_indices.shape[0]) // 2
-    if overlap_audio_steps <= 0 or overlap_audio_steps >= steps_per_channel:
-        return
-    pin_indices = audio_target_indices.reshape(2, steps_per_channel)[:, :overlap_audio_steps].reshape(-1)
-    new_mask = audio_update_mask.clone()
-    new_mask[pin_indices] = False
-    branch.audio_update_mask_dev = new_mask
-    branch.audio_update_mask = new_mask.cpu()
-    audio_dev = overlap_audio_rows.to(device=device, dtype=torch.float32)
-    audio_anchor = inputs.get("audio_anchor")
-    inputs["audio_anchor"] = torch.cat([audio_anchor, audio_dev], dim=0) if audio_anchor is not None else audio_dev
+    device = branch.update_mask_dev.device
+    target_indices = torch.nonzero(branch.update_mask_dev, as_tuple=False).squeeze(-1)
+    history_len = int(history_rows.shape[0])
+    if history_len <= 0 or history_len >= int(target_indices.shape[0]):
+        raise ValueError(f"history of {history_len} rows does not fit {int(target_indices.shape[0])} target rows")
+    history_indices = target_indices[:history_len]
+    tail = history_rows.to(device=device, dtype=torch.float32)
+    noise = inputs["video_rows"][history_indices].to(device=device, dtype=torch.float32).clone()
+
+    audio_indices: torch.Tensor | None = None
+    audio_tail: torch.Tensor | None = None
+    audio_noise: torch.Tensor | None = None
+    if audio_history_rows is not None:
+        if sigmas_audio is None:
+            raise ValueError("sigmas_audio is required to hold audio history")
+        audio_targets = torch.nonzero(branch.audio_update_mask_dev, as_tuple=False).squeeze(-1)
+        steps_per_channel = int(audio_targets.shape[0]) // 2
+        hold_steps = int(audio_history_rows.shape[0]) // 2
+        if hold_steps <= 0 or hold_steps >= steps_per_channel:
+            raise ValueError(f"audio history of {hold_steps} steps does not fit {steps_per_channel} target steps")
+        audio_indices = audio_targets.reshape(2, steps_per_channel)[:, :hold_steps].reshape(-1)
+        audio_tail = audio_history_rows.to(device=device, dtype=torch.float32)
+        audio_noise = inputs["audio_rows"][audio_indices].to(device=device, dtype=torch.float32).clone()
+
+    def reinject(step: int, video_rows: torch.Tensor, audio_rows: torch.Tensor) -> None:
+        sigma = float(sigmas_video[step + 1])
+        if sigma >= release_sigma:
+            video_rows[history_indices] = (1.0 - sigma) * tail + sigma * noise
+        if audio_indices is not None and sigmas_audio is not None:
+            sigma_a = float(sigmas_audio[step + 1])
+            if sigma_a >= release_sigma:
+                audio_rows[audio_indices] = (1.0 - sigma_a) * audio_tail + sigma_a * audio_noise
+        if on_step is not None:
+            on_step(step, video_rows, audio_rows)
+
+    return reinject
+
+
+# A freshly generated window's audio fades in from near silence over a few
+# seconds. Where the previous window is louder, the new window's onset is
+# lifted towards the previous level: the shortfall is compensated in full for
+# the first MATCH seconds, then the compensation fades out by the end of the
+# RELEASE span. The gain never attenuates and is capped.
+MINIMAX_H3_AUDIO_ONSET_MATCH_SECONDS = 2.0
+MINIMAX_H3_AUDIO_ONSET_RELEASE_SECONDS = 4.0
+MINIMAX_H3_AUDIO_ONSET_MAX_GAIN = 8.0
+
+
+def _audio_level(audio: torch.Tensor, *, sample_rate: int) -> float:
+    """RMS of the last second of ``audio`` (B, C, samples)."""
+    tail = audio[..., -min(sample_rate, int(audio.shape[-1])) :].float()
+    return float(tail.pow(2).mean().sqrt()) if tail.numel() else 0.0
+
+
+def _match_audio_onset(
+    reference_level: float,
+    audio: torch.Tensor,
+    *,
+    sample_rate: int,
+    match_seconds: float = MINIMAX_H3_AUDIO_ONSET_MATCH_SECONDS,
+    release_seconds: float = MINIMAX_H3_AUDIO_ONSET_RELEASE_SECONDS,
+    max_gain: float = MINIMAX_H3_AUDIO_ONSET_MAX_GAIN,
+) -> torch.Tensor:
+    """Lift the onset of a window's ``audio`` (B, C, samples) towards ``reference_level``.
+
+    ``reference_level`` is the RMS of the previous window's last second, taken
+    before the shared span is spliced. The onset's short-time RMS envelope is
+    compared against it and the shortfall is compensated with a smoothed,
+    capped gain: in full for ``match_seconds``, then fading to unity by
+    ``release_seconds``. Applied to the whole window before splicing, so the
+    gain is continuous through the hand-over. Returns ``audio`` modified in
+    place.
+    """
+    onset = min(int(round(release_seconds * sample_rate)), int(audio.shape[-1]))
+    if onset <= 0:
+        return audio
+    hop = max(1, sample_rate // 50)  # 20 ms
+    head = audio[..., :onset].float()
+    frames = head.shape[-1] // hop
+    if frames == 0 or reference_level <= 0.0:
+        return audio
+    envelope = head[..., : frames * hop].reshape(*head.shape[:-1], frames, hop).pow(2).mean(dim=(0, 1, 3)).sqrt()
+    # Smooth the envelope over ~100 ms so the gain does not pump (edge values
+    # are replicated so the ends are not pulled towards zero).
+    kernel = torch.ones(1, 1, 5, dtype=envelope.dtype) / 5.0
+    padded = torch.nn.functional.pad(envelope.view(1, 1, -1), (2, 2), mode="replicate")
+    smoothed = torch.nn.functional.conv1d(padded, kernel).view(-1)
+    gain = (reference_level / (smoothed + 1e-6)).clamp(min=1.0, max=max_gain)
+    match_frames = min(frames, int(round(match_seconds * sample_rate)) // hop)
+    release_frames = max(1, frames - match_frames)
+    ramp = torch.ones(frames, dtype=gain.dtype)
+    ramp[match_frames:] = 1.0 - torch.arange(1, frames - match_frames + 1, dtype=gain.dtype) / release_frames
+    gain = 1.0 + (gain - 1.0) * ramp
+    per_sample = torch.nn.functional.interpolate(
+        gain.view(1, 1, -1), size=frames * hop, mode="linear", align_corners=False
+    )
+    audio[..., : frames * hop] = (head[..., : frames * hop] * per_sample.view(-1)).to(audio.dtype)
+    return audio
+
+
+def _splice_span(previous: torch.Tensor, head: torch.Tensor, *, dim: int, hold: int, fade: int) -> torch.Tensor:
+    """Hand the trailing ``head``-sized span of ``previous`` over to ``head`` along ``dim``, in place.
+
+    Both tensors render the same span of the timeline: the previous window's
+    tail and the next window's head. The first ``hold`` entries stay the
+    previous window's, the next ``fade`` entries cross-fade into ``head``, and
+    the rest of the span is ``head``. Video (B, C, T, H, W) fades with a
+    smoothstep ramp; audio (B, C, samples) with an equal-power ramp so the
+    loudness of two independent renderings stays level. ``previous`` is
+    modified in place and returned.
+    """
+    span = int(head.shape[dim])
+    if span <= 0:
+        return previous
+    if span > int(previous.shape[dim]):
+        raise ValueError(f"span {span} exceeds the previous window's {int(previous.shape[dim])}")
+    hold = max(0, min(hold, span))
+    fade = max(0, min(fade, span - hold))
+    tail = previous.narrow(dim, int(previous.shape[dim]) - span, span)
+    head = head.to(device=previous.device, dtype=previous.dtype)
+    if fade:
+        shape = [1] * previous.ndim
+        shape[dim] = fade
+        ramp = (torch.arange(1, fade + 1, dtype=previous.dtype, device=previous.device) / (fade + 1)).view(shape)
+        if dim == 2 and previous.ndim == 5:
+            weight_next = ramp * ramp * (3.0 - 2.0 * ramp)
+            weight_prev = 1.0 - weight_next
+        else:
+            weight_next = torch.sin(ramp * (torch.pi / 2))
+            weight_prev = torch.cos(ramp * (torch.pi / 2))
+        tail.narrow(dim, hold, fade).mul_(weight_prev).add_(weight_next * head.narrow(dim, hold, fade))
+    rest = span - hold - fade
+    if rest:
+        tail.narrow(dim, hold + fade, rest).copy_(head.narrow(dim, hold + fade, rest))
+    return previous
 
 
 def _pin_overlap_rows(
@@ -2626,11 +2778,19 @@ class MiniMaxH3Pipeline(
         the previous window is decoded, the frame the next window starts on
         (its handoff frame) is encoded as a still keyframe at frame 0 and the
         prompt is re-encoded with that picture, exactly as a user-supplied
-        first frame is conditioned. The window's leading frames reproduce
-        the handoff span and are dropped before concatenation. The audio
-        prefix is pinned into the target rows because the FL2VA DiT has no
-        trained audio-reference channel. An fl2va request's first keyframe
-        anchors window 0 and its last keyframe anchors the final window.
+        first frame is conditioned. The first ``MINIMAX_H3_HISTORY_HOLD_LATENTS``
+        latents of the shared span are also held on the previous window's
+        tail while noise is high (see :func:`_history_reinjection`), so the
+        window starts with the real motion, and the first
+        ``MINIMAX_H3_AUDIO_HOLD_SECONDS`` of its audio are held the same way so
+        the ambience does not fade in from silence again. On
+        concatenation the previous window is kept through the held frames,
+        video and audio cross-fade to the new window for up to
+        ``MINIMAX_H3_CROSSFADE_SECONDS`` (as far as the span allows), and the
+        rest of the span is the new window's (see :func:`_splice_span`); the
+        new window's audio onset is lifted towards the previous level (see
+        :func:`_match_audio_onset`). An fl2va request's first keyframe anchors
+        window 0 and its last keyframe anchors the final window.
         """
         del latent_t, audio_t, num_frames, visual_condition_shape, audio_condition, ref_audio_t, ref_blocks
         del audio_condition_lengths
@@ -2641,8 +2801,15 @@ class MiniMaxH3Pipeline(
             )
         wt = windowing.window_latent_t
         wa = windowing.window_audio_t
-        overlap_a = windowing.overlap_audio_t
+        overlap_t = windowing.overlap_latent_t
         trim_frames, trim_samples = _window_trim(windowing, sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE)
+        # Hand-over geometry inside the shared span: held frames, then a short
+        # cross-fade, then the new window's rendering.
+        hold_t = min(MINIMAX_H3_HISTORY_HOLD_LATENTS, overlap_t)
+        hold_frames = MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(hold_t)
+        fade_frames = round(MINIMAX_H3_CROSSFADE_SECONDS * MINIMAX_H3_FPS)
+        hold_samples = round(hold_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
+        fade_samples = round(MINIMAX_H3_CROSSFADE_SECONDS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
         frame_rows = (latent_h // 2) * (latent_w // 2)
 
         def keyframe_rows_for(indices: list[int] | None) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
@@ -2700,7 +2867,9 @@ class MiniMaxH3Pipeline(
         video_parts: list[torch.Tensor] = []
         audio_parts: list[torch.Tensor] = []
         handoff: Image.Image | None = None
+        prev_video_latent: torch.Tensor | None = None
         prev_audio_latent: torch.Tensor | None = None
+        hold_a = min(round(MINIMAX_H3_AUDIO_HOLD_SECONDS * MINIMAX_H3_AUDIO_LATENT_HZ), windowing.overlap_audio_t)
         total_steps = windowing.num_windows * max(len(seed_kwargs["sigmas_video"]) - 1, 0)
         with self.progress_bar(total=total_steps) as progress:
             for window_index in range(windowing.num_windows):
@@ -2709,8 +2878,8 @@ class MiniMaxH3Pipeline(
                 )
                 keyframe_rows, keyframe_shapes = keyframe_rows_for(window_keyframes)
                 window_images = keyframe_images_for(window_keyframes)
+                tail_video_rows: torch.Tensor | None = None
                 tail_audio_rows: torch.Tensor | None = None
-                tail_audio_latent: torch.Tensor | None = None
                 if window_index == 0:
                     cond_rows, cond_shapes, cond_keyframes = keyframe_rows, keyframe_shapes, window_keyframes
                     # Window 0 keeps the request's own conditioning unless a
@@ -2720,7 +2889,7 @@ class MiniMaxH3Pipeline(
                     else:
                         window_text = window_text_for(window_images)
                 else:
-                    assert handoff is not None and prev_audio_latent is not None
+                    assert handoff is not None and prev_video_latent is not None and prev_audio_latent is not None
                     with self._component_on_device(self.video_vae):
                         handoff_rows = self.video_vae.encode_image(handoff) if rank == 0 else None
                     handoff_rows = _broadcast_tensor(handoff_rows, dtype=torch.float32, device=self.device)
@@ -2731,10 +2900,21 @@ class MiniMaxH3Pipeline(
                     cond_shapes = [(1, latent_h, latent_w), *keyframe_shapes]
                     cond_keyframes = _continuation_keyframes(window_keyframes)
                     window_text = window_text_for([handoff, *window_images])
-                    tail_audio_latent = prev_audio_latent[:, :, -overlap_a:]
-                    tail_audio_rows = minimax_h3_pack_audio_latent(tail_audio_latent)
-                # Residency is scoped per window so the decode below runs
-                # with DiT layers released, as the offloaders expect.
+                    # The first latents of the shared span (video, and half a
+                    # second of audio) are held on the previous window's tail
+                    # during denoising; the rest is generated and spliced
+                    # with the real tail afterwards.
+                    span_start = int(prev_video_latent.shape[2]) - overlap_t
+                    tail_video_rows = minimax_h3_patchify_video_latent(
+                        prev_video_latent[:, :, span_start : span_start + hold_t], patch_size=(1, 2, 2)
+                    )
+                    span_start_a = int(prev_audio_latent.shape[2]) - windowing.overlap_audio_t
+                    tail_audio_rows = minimax_h3_pack_audio_latent(
+                        prev_audio_latent[:, :, span_start_a : span_start_a + hold_a]
+                    )
+
+                # Residency is scoped to the denoise so the decode runs with
+                # DiT layers released, as the offloaders expect.
                 with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
                     inputs = self._build_denoise_inputs(
                         **seed_kwargs,
@@ -2750,9 +2930,18 @@ class MiniMaxH3Pipeline(
                         audio_condition_lengths=None,
                         keyframe_frame_indices=cond_keyframes,
                     )
-                    if tail_audio_rows is not None:
-                        _pin_overlap_audio_rows(
-                            inputs, overlap_audio_rows=tail_audio_rows, overlap_audio_steps=overlap_a
+
+                    def on_step(step: int, video: torch.Tensor, audio: torch.Tensor) -> None:
+                        progress.update()
+
+                    if tail_video_rows is not None:
+                        on_step = _history_reinjection(
+                            inputs,
+                            history_rows=tail_video_rows,
+                            sigmas_video=seed_kwargs["sigmas_video"],
+                            on_step=on_step,
+                            audio_history_rows=tail_audio_rows,
+                            sigmas_audio=seed_kwargs["sigmas_audio"],
                         )
                     video_latent, audio_latent = self._run_window_denoise(
                         inputs=inputs,
@@ -2760,23 +2949,35 @@ class MiniMaxH3Pipeline(
                         latent_t=wt,
                         latent_h=latent_h,
                         latent_w=latent_w,
-                        audio_t=wa if tail_audio_rows is None else wa - overlap_a,
-                        on_step=lambda step, video, audio: progress.update(),
+                        audio_t=wa,
+                        on_step=on_step,
                     )
-                if tail_audio_latent is not None:
-                    # Pinned audio rows are excluded from the unpacked
-                    # target; re-attach the clean tail so the window is
-                    # decoded with its real context, then trimmed.
-                    audio_latent = torch.cat([tail_audio_latent, audio_latent], dim=2)
-                prev_audio_latent = audio_latent
-                # Decode outside the residency scope: offloaders release DiT
-                # layers before VAE decode to bound peak memory.
                 video, audio = self.decode(video_latent, audio_latent, height=height, width=width)
+                prev_video_latent, prev_audio_latent = video_latent, audio_latent
                 if window_index < windowing.num_windows - 1:
                     # Decoded video is (B, C, T, H, W) in [0, 1].
                     frame = (video[0, :, handoff_frame_index].detach().float().cpu().clamp(0, 1) * 255).round()
                     handoff = Image.fromarray(frame.permute(1, 2, 0).to(torch.uint8).numpy(), mode="RGB")
                 if window_index > 0:
+                    # The previous window's tail and this window's head both
+                    # render the shared span. Keep the previous window through
+                    # the held frames, cross-fade for up to half a second, then
+                    # take this window's rendering; drop what this window repeats.
+                    video_parts[-1] = _splice_span(
+                        video_parts[-1], video[:, :, :trim_frames].cpu(), dim=2, hold=hold_frames, fade=fade_frames
+                    )
+                    # The new window's audio fades in from near silence; lift
+                    # its onset towards the previous window's level (measured
+                    # before the splice) before the span is spliced, so the
+                    # gain is continuous through the hand-over.
+                    audio = _match_audio_onset(
+                        _audio_level(audio_parts[-1], sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE),
+                        audio.cpu(),
+                        sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                    )
+                    audio_parts[-1] = _splice_span(
+                        audio_parts[-1], audio[..., :trim_samples], dim=-1, hold=hold_samples, fade=fade_samples
+                    )
                     video = video[:, :, trim_frames:]
                     audio = audio[..., trim_samples:]
                 # Finished windows are staged on the host so device memory
