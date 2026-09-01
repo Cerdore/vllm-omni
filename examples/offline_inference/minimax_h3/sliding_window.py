@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax-H3 sliding-window generation for videos longer than 15 seconds.
 
-Each window stays inside the native 4-15 s contract; the previous window's
-tail (video + audio) conditions the next window, and the regenerated overlap is
-dropped on concatenation. This runs in request mode (no --step-execution).
+Each window stays inside the native 4-15 s contract and is decoded on its own;
+the frame the next window starts on is taken from the decoded previous window
+and conditions it as a first-frame keyframe (the previous audio tail is pinned),
+and the frames that reproduce the shared span are dropped on concatenation.
+This runs in request mode (no --step-execution).
 
 Example:
 
@@ -64,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         "--overlap-frames",
         type=int,
         default=None,
-        help="Overlap request in frames; unset uses the server default (58)",
+        help="Overlap request in frames; unset uses the server default (5)",
     )
     parser.add_argument("--window-duration", type=float, default=15.0)
     parser.add_argument("--width", type=int, default=1344)
