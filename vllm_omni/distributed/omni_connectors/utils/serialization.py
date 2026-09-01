@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
@@ -31,6 +31,7 @@ def _unchunk_bytes(data: Any) -> bytes:
     if isinstance(data, list):
         return b"".join(data)
     return data
+
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"

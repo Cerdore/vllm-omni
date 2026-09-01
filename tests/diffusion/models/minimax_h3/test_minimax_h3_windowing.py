@@ -81,7 +81,10 @@ def test_windowing_inactive_for_single_window():
     # Within the native contract and no num_segments -> single window.
     assert (
         _resolve_minimax_h3_windowing(
-            duration=8.0, fps=24, num_segments=None, overlap_frames=None,
+            duration=8.0,
+            fps=24,
+            num_segments=None,
+            overlap_frames=None,
             window_duration=None,
         )
         is None
@@ -89,7 +92,10 @@ def test_windowing_inactive_for_single_window():
     # num_segments=1 is an explicit single-window request (no windowing).
     assert (
         _resolve_minimax_h3_windowing(
-            duration=8.0, fps=24, num_segments=1, overlap_frames=None,
+            duration=8.0,
+            fps=24,
+            num_segments=1,
+            overlap_frames=None,
             window_duration=None,
         )
         is None
@@ -104,7 +110,10 @@ def test_windowing_rejects_overlap_larger_than_window():
 
     with pytest.raises(OmniClientError):
         _resolve_minimax_h3_windowing(
-            duration=30.0, fps=24, num_segments=2, overlap_frames=400,
+            duration=30.0,
+            fps=24,
+            num_segments=2,
+            overlap_frames=400,
             window_duration=None,
         )
 
@@ -181,9 +190,7 @@ def test_audio_history_rows_round_trip_through_latent_tail():
     tail = audio_latent[:, :, -overlap_audio_t:]
     rows = minimax_h3_pack_audio_latent(tail)
     assert rows.shape == (overlap_audio_t * 2, 32)
-    restored = minimax_h3_unpack_audio_tokens(
-        rows, audio_t=overlap_audio_t * 2, audio_channel=2
-    )
+    restored = minimax_h3_unpack_audio_tokens(rows, audio_t=overlap_audio_t * 2, audio_channel=2)
     torch.testing.assert_close(restored, tail)
 
 

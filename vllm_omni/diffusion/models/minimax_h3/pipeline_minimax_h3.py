@@ -238,27 +238,19 @@ def _resolve_minimax_h3_windowing(
     elif isinstance(num_segments, str) and num_segments.lower() == "auto":
         auto = True
         if duration is None:
-            raise OmniClientError(
-                "MiniMax H3 num_segments='auto' requires extra_args duration"
-            )
+            raise OmniClientError("MiniMax H3 num_segments='auto' requires extra_args duration")
     elif isinstance(num_segments, bool) or not isinstance(num_segments, int):
-        raise OmniClientError(
-            f"MiniMax H3 num_segments must be a positive int or 'auto', got {num_segments!r}"
-        )
+        raise OmniClientError(f"MiniMax H3 num_segments must be a positive int or 'auto', got {num_segments!r}")
     elif num_segments <= 1:
         # An explicit single segment is an ordinary single-window request.
         return None
 
-    window_seconds = float(window_duration) if window_duration is not None else float(
-        MINIMAX_H3_DEFAULT_WINDOW_SECONDS
-    )
+    window_seconds = float(window_duration) if window_duration is not None else float(MINIMAX_H3_DEFAULT_WINDOW_SECONDS)
     if (
         not math.isfinite(window_seconds)
         or not MINIMAX_H3_MIN_OUTPUT_SECONDS <= window_seconds <= MINIMAX_H3_MAX_OUTPUT_SECONDS
     ):
-        raise OmniClientError(
-            f"MiniMax H3 window_duration must be in [4, 15] seconds, got {window_seconds}"
-        )
+        raise OmniClientError(f"MiniMax H3 window_duration must be in [4, 15] seconds, got {window_seconds}")
 
     window_num_frames = minimax_h3_align_frame_count(int(round(window_seconds * fps)))
     window_latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(window_num_frames)
@@ -269,8 +261,7 @@ def _resolve_minimax_h3_windowing(
     )
     if overlap >= window_num_frames:
         raise OmniClientError(
-            f"MiniMax H3 overlap_frames {overlap} must be smaller than the window "
-            f"{window_num_frames} frames"
+            f"MiniMax H3 overlap_frames {overlap} must be smaller than the window {window_num_frames} frames"
         )
     overlap_latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(overlap)
     overlap_audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(overlap / fps)
@@ -361,23 +352,19 @@ def _pin_overlap_rows(
         # the same conditioning recipe as other refs.
         cond_t = MINIMAX_H3_IMGVID_COND_TIMESTEP
         sigma = 1.0 - cond_t
-        gen = torch.Generator(device=overlap_video_rows.device).manual_seed(
-            2048 + overlap_video_frames
-        )
+        gen = torch.Generator(device=overlap_video_rows.device).manual_seed(2048 + overlap_video_frames)
         noise = torch.randn(
-            overlap_video_rows.shape, generator=gen,
-            dtype=overlap_video_rows.dtype, device=overlap_video_rows.device,
+            overlap_video_rows.shape,
+            generator=gen,
+            dtype=overlap_video_rows.dtype,
+            device=overlap_video_rows.device,
         )
-        aug_rows = (sigma * noise + (1.0 - sigma) * overlap_video_rows).to(
-            dtype=overlap_video_rows.dtype
-        )
+        aug_rows = (sigma * noise + (1.0 - sigma) * overlap_video_rows).to(dtype=overlap_video_rows.dtype)
         # cond_anchor follows ~update order; pinned rows append after the
         # original cond rows.
         aug_dev = aug_rows.to(device=device, dtype=torch.float32)
         cond_anchor = inputs.get("cond_anchor")
-        inputs["cond_anchor"] = (
-            torch.cat([cond_anchor, aug_dev], dim=0) if cond_anchor is not None else aug_dev
-        )
+        inputs["cond_anchor"] = torch.cat([cond_anchor, aug_dev], dim=0) if cond_anchor is not None else aug_dev
 
     # Audio: AUDIO_REF_COND_TIMESTEP == 1.0, so the anchor is the clean overlap
     # latent (no noise draw).
@@ -392,9 +379,9 @@ def _pin_overlap_rows(
         branch.audio_update_mask = new_mask.cpu()
         audio_dev = overlap_audio_rows.to(device=device, dtype=torch.float32)
         audio_anchor = inputs.get("audio_anchor")
-        inputs["audio_anchor"] = (
-            torch.cat([audio_anchor, audio_dev], dim=0) if audio_anchor is not None else audio_dev
-        )
+        inputs["audio_anchor"] = torch.cat([audio_anchor, audio_dev], dim=0) if audio_anchor is not None else audio_dev
+
+
 MINIMAX_H3_TURBO_SIGMA_POINTS = 5
 MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
 MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
@@ -1332,15 +1319,11 @@ class MiniMaxH3Pipeline(
         duration_value: float | None = None
         if duration is not None:
             if isinstance(duration, bool):
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be a number, got {duration!r}"
-                )
+                raise OmniClientError(f"MiniMax H3 output duration must be a number, got {duration!r}")
             try:
                 duration_value = float(duration)
             except (TypeError, ValueError) as exc:
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be a number, got {duration!r}"
-                ) from exc
+                raise OmniClientError(f"MiniMax H3 output duration must be a number, got {duration!r}") from exc
             if not math.isfinite(duration_value):
                 raise OmniClientError(f"MiniMax H3 output duration must be finite, got {duration}")
 
@@ -1360,12 +1343,8 @@ class MiniMaxH3Pipeline(
             # loop in :meth:`diffuse` carries overlap/stride from ``windowing``.
             requested_frames = windowing.window_num_frames
         elif duration_value is not None:
-            if (
-                not MINIMAX_H3_MIN_OUTPUT_SECONDS <= duration_value <= MINIMAX_H3_MAX_OUTPUT_SECONDS
-            ):
-                raise OmniClientError(
-                    f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration_value}"
-                )
+            if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= duration_value <= MINIMAX_H3_MAX_OUTPUT_SECONDS:
+                raise OmniClientError(f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration_value}")
             requested_frames = int(round(duration_value * fps))
         elif int(sampling.num_frames or 1) > 1:
             requested_frames = int(sampling.num_frames)
@@ -2355,12 +2334,12 @@ class MiniMaxH3Pipeline(
         """
         wt = windowing.window_latent_t
         wa = windowing.window_audio_t
-        ot = windowing.overlap_latent_t
-        oa = windowing.overlap_audio_t
+        overlap_t = windowing.overlap_latent_t
+        overlap_a = windowing.overlap_audio_t
         history_block: dict[str, Any] = {
             "kind": "video_audio",
-            "ref_audio_t": oa,
-            "latent_t": ot,
+            "ref_audio_t": overlap_a,
+            "latent_t": overlap_t,
             "latent_h": latent_h,
             "latent_w": latent_w,
         }
@@ -2412,7 +2391,8 @@ class MiniMaxH3Pipeline(
         prev_video_latent: torch.Tensor | None = None
         prev_audio_latent: torch.Tensor | None = None
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
-            total_steps = windowing.num_windows * num_steps
+            # Each window fires len(sigmas) - 1 step callbacks, not num_steps.
+            total_steps = windowing.num_windows * max(len(video_sigmas) - 1, 0)
             with self.progress_bar(total=total_steps) as progress:
                 for window_index in range(windowing.num_windows):
                     if window_index == 0:
@@ -2420,13 +2400,9 @@ class MiniMaxH3Pipeline(
                             **seed_kwargs,
                             seed=seed,
                             visual_condition=visual_condition,
-                            visual_condition_shape=(
-                                visual_condition_shapes[0] if visual_condition_shapes else None
-                            ),
+                            visual_condition_shape=(visual_condition_shapes[0] if visual_condition_shapes else None),
                             audio_condition=audio_condition,
-                            ref_audio_t=(
-                                audio_condition_lengths[0] if audio_condition_lengths else None
-                            ),
+                            ref_audio_t=(audio_condition_lengths[0] if audio_condition_lengths else None),
                             ref_blocks=ref_blocks,
                             visual_condition_shapes=visual_condition_shapes,
                             audio_condition_lengths=audio_condition_lengths,
@@ -2435,8 +2411,8 @@ class MiniMaxH3Pipeline(
                     else:
                         # Previous tail, patchified once and reused as both
                         # the history block and the pinned overlap.
-                        overlap_video_latent_full = prev_video_latent[:, :, -ot:, :, :]
-                        overlap_audio_latent_full = prev_audio_latent[:, :, -oa:]
+                        overlap_video_latent_full = prev_video_latent[:, :, -overlap_t:, :, :]
+                        overlap_audio_latent_full = prev_audio_latent[:, :, -overlap_a:]
                         tail_video_rows = minimax_h3_patchify_video_latent(
                             overlap_video_latent_full, patch_size=(1, 2, 2)
                         )
@@ -2444,11 +2420,9 @@ class MiniMaxH3Pipeline(
                         # Packer order: [identity-anchor?, *user refs?, history].
                         cont_ref_blocks = [*cont_prefix_ref_blocks, history_block]
                         cont_visual = _tensor_with_tail(cont_prefix_visual, tail_video_rows)
-                        cont_visual_shapes = _list_with_tail(
-                            cont_prefix_visual_shapes, (ot, latent_h, latent_w)
-                        )
+                        cont_visual_shapes = _list_with_tail(cont_prefix_visual_shapes, (overlap_t, latent_h, latent_w))
                         cont_audio = _tensor_with_tail(cont_prefix_audio, tail_audio_rows)
-                        cont_audio_lengths = _list_with_tail(cont_prefix_audio_lengths, oa)
+                        cont_audio_lengths = _list_with_tail(cont_prefix_audio_lengths, overlap_a)
                         inputs = self._build_denoise_inputs(
                             **seed_kwargs,
                             seed=seed + window_index,
@@ -2466,17 +2440,17 @@ class MiniMaxH3Pipeline(
                             inputs,
                             overlap_video_rows=tail_video_rows,
                             overlap_audio_rows=tail_audio_rows,
-                            overlap_video_frames=ot,
-                            overlap_audio_steps=oa,
+                            overlap_video_frames=overlap_t,
+                            overlap_audio_steps=overlap_a,
                             frame_rows=frame_rows,
                         )
                     video_latent, audio_latent = self._run_window_denoise(
                         inputs=inputs,
                         transformer=transformer,
-                        latent_t=wt if window_index == 0 else wt - ot,
+                        latent_t=wt if window_index == 0 else wt - overlap_t,
                         latent_h=latent_h,
                         latent_w=latent_w,
-                        audio_t=wa if window_index == 0 else wa - oa,
+                        audio_t=wa if window_index == 0 else wa - overlap_a,
                         on_step=lambda step, video, audio: progress.update(),
                     )
                     if window_index == 0:
@@ -2492,9 +2466,7 @@ class MiniMaxH3Pipeline(
                         if ref_blocks:
                             cont_prefix_ref_blocks.extend(ref_blocks)
                         if visual_condition is not None:
-                            cont_prefix_visual = _tensor_with_tail(
-                                cont_prefix_visual, visual_condition
-                            )
+                            cont_prefix_visual = _tensor_with_tail(cont_prefix_visual, visual_condition)
                             cont_prefix_visual_shapes.extend(visual_condition_shapes)
                         cont_prefix_audio = audio_condition
                         if audio_condition_lengths:
@@ -2503,12 +2475,8 @@ class MiniMaxH3Pipeline(
                         prev_audio_latent = audio_latent
                     else:
                         # Reconstruct full window latent for the next tail.
-                        prev_video_latent = torch.cat([
-                            overlap_video_latent_full, video_latent
-                        ], dim=2)
-                        prev_audio_latent = torch.cat([
-                            overlap_audio_latent_full, audio_latent
-                        ], dim=2)
+                        prev_video_latent = torch.cat([overlap_video_latent_full, video_latent], dim=2)
+                        prev_audio_latent = torch.cat([overlap_audio_latent_full, audio_latent], dim=2)
                     video_parts.append(video_latent)
                     audio_parts.append(audio_latent)
         video_latent = torch.cat(video_parts, dim=2)
@@ -2646,9 +2614,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(f"{task} does not accept a video condition")
 
         image = images[0] if images else None
-        height, width, num_frames, latent_t, audio_t, windowing = self._resolve_shape(
-            task, sampling, image
-        )
+        height, width, num_frames, latent_t, audio_t, windowing = self._resolve_shape(task, sampling, image)
         if task == "fl2va":
             for item in images:
                 _validate_reference_image(item)

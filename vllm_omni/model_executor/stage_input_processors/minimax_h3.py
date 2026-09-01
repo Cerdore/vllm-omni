@@ -94,9 +94,7 @@ def _ref2va_target_frame_count(sampling_params_list: Sequence[Any]) -> int:
     num_segments = target.get("num_segments", extra_args.get("num_segments"))
     # Sliding-window requests sample references against the per-window contract
     # (4-15 s), not the total duration, so window 0 and the Qwen presentation agree.
-    windowed = num_segments is not None or (
-        duration is not None and float(duration) > 15.0
-    )
+    windowed = num_segments is not None or (duration is not None and float(duration) > 15.0)
     if windowed:
         window_duration = target.get("window_duration", extra_args.get("window_duration"))
         requested = int(round(float(window_duration or 15.0) * 24))

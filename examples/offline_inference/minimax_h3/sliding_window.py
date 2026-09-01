@@ -28,8 +28,7 @@ import numpy as np
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 DEFAULT_PROMPT = (
-    "A drone shot gliding over a coastal cliff at sunrise, waves crashing below, "
-    "with wind and seabird ambience."
+    "A drone shot gliding over a coastal cliff at sunrise, waves crashing below, with wind and seabird ambience."
 )
 
 
@@ -40,6 +39,15 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def num_segments_value(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an int or 'auto'") from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Path to MiniMax-H3/FL2VA")
@@ -48,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration", type=float, default=30.0, help="Total seconds (>15)")
     parser.add_argument(
         "--num-segments",
+        type=num_segments_value,
         default=None,
         help="int >= 2 or 'auto'; defaults to 'auto' when duration > 15",
     )
@@ -127,7 +136,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         output = await generate(engine, args)
     finally:
-        await engine.close()
+        engine.close()
     frames = np.asarray(output.images[0])
     audio = np.asarray(output.multimodal_output.get("audio"))
     summary = {
@@ -139,20 +148,36 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "stage_durations": output.stage_durations,
     }
     if args.output is not None:
-        # The output tensor is HWC uint8 frames; mux video+audio with ffmpeg.
+        # Frames arrive as THWC float32 in [0, 1]; audio as (1, 2, samples)
+        # float32 at 32 kHz. Encode H.264 from uint8 and mux with ffmpeg.
         import imageio.v3 as iio
 
         video_path = args.output.with_suffix(".tmp.mp4")
-        iio.imwrite(video_path, frames, fps=24, codec="libx264", quality=8)
-        # Write raw 32 kHz stereo float32 audio and mux.
-        audio_path = args.output.with_suffix(".tmp.wav")
-        iio.imwrite(audio_path, audio[0].T, format_hint="float32", rate=32000)
+        frames_u8 = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
+        iio.imwrite(video_path, frames_u8, fps=24, codec="libx264", quality=8)
+        audio_path = args.output.with_suffix(".tmp.f32")
+        np.ascontiguousarray(audio[0].T, dtype=np.float32).tofile(audio_path)
         import subprocess
 
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
-                "-c:v", "copy", "-c:a", "aac", str(args.output),
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-f",
+                "f32le",
+                "-ar",
+                "32000",
+                "-ac",
+                "2",
+                "-i",
+                str(audio_path),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                str(args.output),
             ],
             check=True,
         )
