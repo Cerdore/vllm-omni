@@ -7,7 +7,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -121,6 +121,8 @@ def validate_dlo_host_registration_options(
     hwr_mode: object,
 ) -> float:
     """Validate the optional transport budget without probing CUDA or HWR."""
+    if not isinstance(limit_gib, (int, float, str)):
+        raise TypeError(f"dlo_host_registration_limit_gib must be a number; got {type(limit_gib).__name__}")
     value = float(limit_gib)
     if not math.isfinite(value) or value < 0:
         raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
@@ -222,6 +224,9 @@ class DiffusionParallelConfig:
     - When used in hybrid Ulysses+Ring, Ring requires consistent per-rank
       sequence shapes across the ring group.
     """
+
+    ulysses_a2a_permute: bool = False
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
@@ -685,6 +690,19 @@ def resolve_model_class_name(
     return None
 
 
+def uses_diffusers_adapter(od_config: object) -> bool:
+    """Return whether execution uses the Diffusers adapter backend.
+
+    A custom pipeline takes precedence over ``diffusion_load_format`` in the
+    worker, so adapter-specific behavior must only apply when no custom
+    pipeline override is configured.
+    """
+    return (
+        getattr(od_config, "custom_pipeline_args", None) is None
+        and getattr(od_config, "diffusion_load_format", "default") == "diffusers"
+    )
+
+
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
@@ -1070,10 +1088,9 @@ class OmniDiffusionConfig:
             "need_recv_cache", False
         ):
             raise ValueError(
-                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
-                "disable need_recv_cache until connector-aware admission is implemented"
+                "paged_scheduler Diffusion KV does not support imported AR KV; "
+                "disable need_recv_cache until connector-aware import is implemented"
             )
-
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
@@ -1317,10 +1334,6 @@ class OmniDiffusionConfig:
 
         from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 
-        # Default model_class_name for diffusers adapter
-        if self.model_class_name is None and self.diffusion_load_format == "diffusers":
-            self.model_class_name = "DiffusersAdapterPipeline"
-
         assert self.model is not None
         try:
             config_dict = get_diffusion_model_index(
@@ -1330,6 +1343,8 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name is None and self.diffusion_load_format == "diffusers":
+                        self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter
@@ -1370,6 +1385,8 @@ class OmniDiffusionConfig:
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
+                if self.model_class_name is None:
+                    self.model_class_name = "DiffusersAdapterPipeline"
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
                     "Could not find a valid pipeline index per Diffusers format. "
@@ -1667,7 +1684,8 @@ class AttnQuantSpec:
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None or self.dtype_vo is not None
+        # Include flashinfer_backend so a variant pin without dtypes is serialized.
+        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
@@ -1675,7 +1693,7 @@ class AttnQuantSpec:
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
 
 
-class RainFusionPrecision(StrEnum):
+class RainFusionPrecision(str, Enum):
     """Execution precision for block-sparse RainFusion (rf_v3) attention.
 
     ``bf16``: no quantization, pure BF16 sparse attention (official baseline).
@@ -1713,11 +1731,11 @@ class BlockSparseSpec:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
         if self.end_step < 0:
             raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
-        if self.precision not in {p.value for p in RainFusionPrecision}:
-            raise ValueError(
-                f"block_sparse.precision must be one of {sorted(p.value for p in RainFusionPrecision)}; "
-                f"got {self.precision!r}."
-            )
+        precision = self.precision.value if isinstance(self.precision, RainFusionPrecision) else self.precision
+        valid = {member.value for member in RainFusionPrecision}
+        if precision not in valid:
+            raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
+        self.precision = precision
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1782,18 +1800,19 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.enabled:
+        if self.quant is not None:
             q = self.quant
-            quant_kw: dict[str, Any] = {
-                "dtype_qk": q.dtype_qk,
-                "q_block_size": q.q_block_size,
-                "k_block_size": q.k_block_size,
-            }
-            if q.dtype_vo is not None:
-                quant_kw["dtype_vo"] = q.dtype_vo
+            quant_kw: dict[str, Any] = {}
+            if q.dtype_qk is not None or q.dtype_vo is not None:
+                quant_kw["dtype_qk"] = q.dtype_qk
+                quant_kw["q_block_size"] = q.q_block_size
+                quant_kw["k_block_size"] = q.k_block_size
+                if q.dtype_vo is not None:
+                    quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
-            kw["quant"] = quant_kw
+            if quant_kw:
+                kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
         if self.block_sparse is not None:
