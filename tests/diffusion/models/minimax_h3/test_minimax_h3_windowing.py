@@ -568,46 +568,6 @@ def test_splice_span_holds_fades_then_hands_over():
         _splice_span(previous, torch.ones(1, 3, 21, 2, 2), dim=2, hold=1, fade=1)
 
 
-def test_pin_overlap_rows_ref2va_is_channel_major_for_audio():
-    """The ref2va helper pins whole leading video frames and, for audio, the
-    leading steps of BOTH channel blocks."""
-    from types import SimpleNamespace
-
-    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import minimax_h3_pack_audio_latent
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _pin_overlap_rows
-
-    frame_rows, latent_t, wa = 4, 10, 6
-    overlap_frames, overlap_a = 2, 2
-    branch = SimpleNamespace(
-        update_mask_dev=torch.ones(latent_t * frame_rows, dtype=torch.bool),
-        update_mask=torch.ones(latent_t * frame_rows, dtype=torch.bool),
-        audio_update_mask_dev=torch.ones(2 * wa, dtype=torch.bool),
-        audio_update_mask=torch.ones(2 * wa, dtype=torch.bool),
-        static_kwargs={},
-    )
-    video_rows = torch.zeros(overlap_frames * frame_rows, 96)
-    audio_rows = minimax_h3_pack_audio_latent(torch.zeros(2, 32, overlap_a))
-    inputs: dict[str, Any] = {"branch": branch, "cond_anchor": None, "audio_anchor": None}
-    _pin_overlap_rows(
-        inputs,
-        overlap_video_rows=video_rows,
-        overlap_audio_rows=audio_rows,
-        overlap_video_frames=overlap_frames,
-        overlap_audio_steps=overlap_a,
-        frame_rows=frame_rows,
-    )
-    frozen_video = ~branch.update_mask_dev
-    assert int(frozen_video.sum()) == overlap_frames * frame_rows
-    assert bool(frozen_video[: overlap_frames * frame_rows].all())
-    frozen_audio = ~branch.audio_update_mask_dev
-    expected = torch.zeros(2 * wa, dtype=torch.bool)
-    expected[:overlap_a] = True
-    expected[wa : wa + overlap_a] = True
-    assert torch.equal(frozen_audio, expected)
-    assert inputs["cond_anchor"].shape[0] == overlap_frames * frame_rows
-    assert inputs["audio_anchor"].shape[0] == 2 * overlap_a
-
-
 # --------------------------------------------------------------------------- #
 # _generate_windowed plumbing on a fake pipeline (no model, no GPU)
 # --------------------------------------------------------------------------- #
