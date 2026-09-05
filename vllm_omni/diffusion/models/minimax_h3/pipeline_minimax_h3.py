@@ -399,6 +399,10 @@ MINIMAX_H3_HISTORY_RELEASE_SIGMA = 0.3
 # from near silence, which is audible as the ambience dropping out.
 MINIMAX_H3_AUDIO_HOLD_SECONDS = 0.5
 
+# Audio handoff: seconds of the previous window's tail packed as a frozen
+# ref block so ref2va continuation windows condition on prior ambience.
+MINIMAX_H3_AUDIO_HANDOFF_SECONDS = 2.0
+
 
 def _history_reinjection(
     inputs: dict[str, Any],
@@ -2765,11 +2769,23 @@ class MiniMaxH3Pipeline(
                     )
                     if is_ref2va:
                         # ref2va continuation: handoff still keyframe as an
-                        # image block, followed by the user's original
-                        # reference blocks; visual condition is the handoff
-                        # rows plus the user's original visual condition.
+                        # image block, an audio handoff block, then the
+                        # user's original reference blocks; visual condition
+                        # is the handoff rows plus the user's original visual.
                         handoff_block = {"kind": "image", "latent_h": latent_h, "latent_w": latent_w}
-                        cond_ref_blocks = [handoff_block, *(ref_blocks or [])]
+                        handoff_audio_t = min(
+                            round(MINIMAX_H3_AUDIO_HANDOFF_SECONDS * MINIMAX_H3_AUDIO_LATENT_HZ),
+                            int(prev_audio_latent.shape[2]),
+                        )
+                        handoff_audio_rows = minimax_h3_pack_audio_latent(
+                            prev_audio_latent[:, :, -handoff_audio_t:]
+                        ).to(device=self.device, dtype=torch.float32)
+                        handoff_audio_block = {"kind": "audio", "ref_audio_t": handoff_audio_t}
+                        cond_ref_blocks = [
+                            handoff_block,
+                            handoff_audio_block,
+                            *(ref_blocks or []),
+                        ]
                         cond_rows = (
                             _tensor_with_tail(handoff_rows, visual_condition)
                             if visual_condition is not None
@@ -2777,9 +2793,13 @@ class MiniMaxH3Pipeline(
                         )
                         cond_shapes = [(1, latent_h, latent_w), *(visual_condition_shapes or [])]
                         cond_keyframes = None
-                        cond_audio = audio_condition
-                        cond_audio_lengths = audio_condition_lengths
-                        cond_ref_audio_t = ref_audio_t
+                        cond_audio = (
+                            _tensor_with_tail(handoff_audio_rows, audio_condition)
+                            if audio_condition is not None
+                            else handoff_audio_rows
+                        )
+                        cond_audio_lengths = [handoff_audio_t, *(audio_condition_lengths or [])]
+                        cond_ref_audio_t = None
                         window_text = ref2va_window_text(handoff)
                     else:
                         # Condition blocks follow keyframe order: the handoff
