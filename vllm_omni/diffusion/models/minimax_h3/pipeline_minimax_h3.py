@@ -2706,6 +2706,27 @@ class MiniMaxH3Pipeline(
                 condition_labels=cont_labels,
             )
 
+        def fl2va_cont_ref2va_text(
+            handoff_image: Image.Image,
+            window_images: list[Image.Image],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # FL2VA/T2VA continuation routed through the Ref2VA packer:
+            # re-encode the prompt in ref2va format so text labels match the
+            # ref_blocks layout. The handoff still is image 1, the handoff
+            # audio is audio 1, and any keyframe images are image 2+.
+            text_images = [handoff_image, *window_images]
+            cont_labels: list[tuple[str, int]] = [("image", 1), ("audio", 1)]
+            image_ordinal = 2
+            for _ in window_images:
+                cont_labels.append(("image", image_ordinal))
+                image_ordinal += 1
+            return self.encode_prompt(
+                task="ref2va",
+                prompt=prompt,
+                images=text_images,
+                condition_labels=cont_labels,
+            )
+
         _, rank, _ = _dit_rank_world()
         is_ref2va = task == "ref2va"
         # The next window's frame 0 is the frame that follows the frames this
@@ -2802,19 +2823,34 @@ class MiniMaxH3Pipeline(
                         cond_ref_audio_t = None
                         window_text = ref2va_window_text(handoff)
                     else:
-                        # Condition blocks follow keyframe order: the handoff
-                        # still (frame 0) first, then this window's own anchors.
-                        cond_rows = (
-                            _tensor_with_tail(handoff_rows, keyframe_rows) if keyframe_rows is not None else None
+                        # FL2VA/T2VA continuation: route through the Ref2VA
+                        # packer so the model sees the same ref-audio layout it
+                        # was trained on. The handoff still becomes a ref
+                        # image block, the previous window's tail audio
+                        # becomes a ref audio block, and any remaining
+                        # keyframes become additional ref image blocks.
+                        handoff_block = {"kind": "image", "latent_h": latent_h, "latent_w": latent_w}
+                        handoff_audio_t = min(
+                            round(MINIMAX_H3_AUDIO_HANDOFF_SECONDS * MINIMAX_H3_AUDIO_LATENT_HZ),
+                            int(prev_audio_latent.shape[2]),
                         )
-                        cond_rows = handoff_rows if cond_rows is None else cond_rows
-                        cond_shapes = [(1, latent_h, latent_w), *keyframe_shapes]
-                        cond_keyframes = _continuation_keyframes(window_keyframes)
-                        cond_audio = None
-                        cond_audio_lengths = None
+                        handoff_audio_rows = minimax_h3_pack_audio_latent(
+                            prev_audio_latent[:, :, -handoff_audio_t:]
+                        ).to(device=self.device, dtype=torch.float32)
+                        handoff_audio_block = {"kind": "audio", "ref_audio_t": handoff_audio_t}
+                        cond_ref_blocks = [handoff_block, handoff_audio_block]
+                        cond_rows = handoff_rows
+                        cond_shapes = [(1, latent_h, latent_w)]
+                        if keyframe_rows is not None:
+                            for shape in keyframe_shapes:
+                                cond_ref_blocks.append({"kind": "image", "latent_h": shape[1], "latent_w": shape[2]})
+                            cond_rows = _tensor_with_tail(handoff_rows, keyframe_rows)
+                            cond_shapes = [(1, latent_h, latent_w), *keyframe_shapes]
+                        cond_keyframes = None
+                        cond_audio = handoff_audio_rows
+                        cond_audio_lengths = [handoff_audio_t]
                         cond_ref_audio_t = None
-                        cond_ref_blocks = None
-                        window_text = window_text_for([handoff, *window_images])
+                        window_text = fl2va_cont_ref2va_text(handoff, window_images)
 
                 # Residency is scoped to the denoise so the decode runs with
                 # DiT layers released, as the offloaders expect.
