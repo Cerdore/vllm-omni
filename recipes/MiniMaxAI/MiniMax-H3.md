@@ -823,9 +823,10 @@ second (as far as the span allows), and the rest of the span is the new
 window's rendering. A freshly generated window fades its audio in from near
 silence over a few seconds, so the new window's audio onset is lifted towards
 the previous window's level (a capped gain that never attenuates: in full for
-two seconds, fading out by four). For ref2va the tail of
-the previous window (video and audio) conditions the next window as a frozen
-`video_audio` history block instead. Set `duration > 15` in `extra_params`
+two seconds, fading out by four). For every task, the previous window's
+tail ~2 s of audio conditions the next window as a frozen audio ref block
+through the Ref2VA packer layout (FL2VA's own layout has no audio slot); the
+handoff still image is carried as a ref image block alongside it. Set `duration > 15` in `extra_params`
 (windowing auto-activates) or pass `extra_params.num_segments` explicitly:
 
 ```bash

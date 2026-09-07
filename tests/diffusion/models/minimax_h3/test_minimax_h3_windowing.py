@@ -267,14 +267,14 @@ def test_video_history_rows_round_trip_through_latent_tail():
     torch.testing.assert_close(restored, tail)
 
 
-def test_identity_anchor_plus_history_block_frozen_row_split():
-    """Ref2VA continuation layout: [image identity-anchor, video_audio history] + target.
+def test_ref2va_continuation_handoff_blocks_frozen_row_split():
+    """Ref2VA continuation layout: [handoff image, handoff audio] + target.
 
     Mirrors the ref_blocks the ref2va window loop assembles for a continuation
-    window: a 1-frame image anchor (window 0's first frame) followed by the
-    video+audio history block (17 latents / 93 audio latents when the overlap
-    is 58 frames), then the target. t2va/fl2va windows take the first-frame
-    path instead (see ``test_continuation_window_is_a_first_frame_request``).
+    window: a 1-frame handoff image block followed by a tail-audio ref block
+    (the previous window's last ~2 s of audio), then the target. FL2VA/T2VA
+    continuation windows take the same ref2va-packed layout; the keyframe side
+    of those windows is covered by ``test_continuation_window_is_a_first_frame_request``.
     """
     from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
         minimax_h3_packed_sequence_ref2va_blocks,
@@ -284,17 +284,10 @@ def test_identity_anchor_plus_history_block_frozen_row_split():
     frame_rows = (latent_h // 2) * (latent_w // 2)
     window_latent_t = 107
     window_audio_t = 603
-    overlap_latent_t = 17
-    overlap_audio_t = 93
+    handoff_audio_t = 80  # MINIMAX_H3_AUDIO_HANDOFF_SECONDS (2 s) * 40 Hz
     ref_blocks = [
         {"kind": "image", "latent_h": latent_h, "latent_w": latent_w},
-        {
-            "kind": "video_audio",
-            "ref_audio_t": overlap_audio_t,
-            "latent_t": overlap_latent_t,
-            "latent_h": latent_h,
-            "latent_w": latent_w,
-        },
+        {"kind": "audio", "ref_audio_t": handoff_audio_t},
     ]
     packed = minimax_h3_packed_sequence_ref2va_blocks(
         text_len=128,
@@ -304,14 +297,13 @@ def test_identity_anchor_plus_history_block_frozen_row_split():
         audio_t=window_audio_t,
         ref_blocks=ref_blocks,
     )
-    # Anchor image (1 frame) + history video (overlap_latent_t frames) are the
-    # frozen visual rows; the target window is the rest.
-    anchor_rows = 1 * frame_rows
-    history_video_rows = overlap_latent_t * frame_rows
-    ref_visual_rows = anchor_rows + history_video_rows
-    assert int(packed["update_mask"][:ref_visual_rows].sum()) == 0
-    assert bool(packed["update_mask"][ref_visual_rows:].all())
-    # Both reference spans are advertised; the target is last.
+    # Handoff image (1 frame) is the frozen visual ref; the target is the rest.
+    handoff_rows = 1 * frame_rows
+    assert int(packed["update_mask"][:handoff_rows].sum()) == 0
+    assert bool(packed["update_mask"][handoff_rows:].all())
+    # The handoff audio ref block freezes audio rows (not all audio is updated).
+    assert int(packed["audio_update_mask"].sum()) < len(packed["audio_update_mask"])
+    # One visual reference span is advertised; the target is last.
     roles = [span["role"] for span in packed["video_spans"]]
     assert roles.count("reference") == 1
     assert roles[-1] == "target"

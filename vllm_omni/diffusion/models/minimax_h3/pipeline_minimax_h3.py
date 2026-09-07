@@ -203,9 +203,12 @@ class MiniMaxH3WindowingPlan:
     its predecessor by ``overlap_latent_t`` video latents (``overlap_frames``
     decoded frames, ``overlap_audio_t`` audio latents), the span both windows
     render and that the later one is spliced into on concatenation.
-    t2va/fl2va continuation windows hold the span's first latents on the
-    previous tail while denoising and anchor on a still of the handoff frame;
-    ref2va windows carry the tail as a frozen ``video_audio`` history block.
+    Continuation windows hold the span's first latents on the previous tail
+    while denoising and anchor on a still of the handoff frame. All tasks
+    route continuation through the Ref2VA packer so the previous window's
+    tail ~2 s audio is carried as a frozen audio ref block — the FL2VA layout
+    has no audio slot and was never trained with ref audio preceding the
+    target, so the Ref2VA layout (which the model was trained on) is used.
     ``is_active`` is False for single-window requests so the legacy path is
     untouched.
     """
@@ -271,6 +274,10 @@ def _resolve_minimax_h3_windowing(
     # (window_latent_t - overlap_latent_t) % 15 == 0; anything else either
     # falls off the VAE's 5n+2 grid or accumulates A/V desync per window.
     requested = int(overlap_frames) if overlap_frames is not None else MINIMAX_H3_DEFAULT_OVERLAP_FRAMES
+    if overlap_frames is not None and requested <= 0:
+        raise OmniClientError(
+            f"MiniMax H3 overlap_frames must be positive, got {requested}"
+        )
     if requested >= window_num_frames:
         raise OmniClientError(
             f"MiniMax H3 overlap_frames {requested} must be smaller than the window {window_num_frames} frames"
@@ -306,6 +313,23 @@ def _resolve_minimax_h3_windowing(
             return None
     else:
         num_windows = int(num_segments)
+        if duration is not None:
+            first_window_duration = window_num_frames / fps
+            continuation_duration = contributed_frames / fps
+            if duration <= first_window_duration and num_windows >= 2:
+                raise OmniClientError(
+                    f"MiniMax H3 duration {duration}s fits in a single window "
+                    f"({first_window_duration:.1f}s); set num_segments=1 or increase duration"
+                )
+            min_windows = 1 + max(
+                0, math.ceil((duration - first_window_duration) / continuation_duration)
+            )
+            if num_windows < min_windows:
+                raise OmniClientError(
+                    f"MiniMax H3 num_segments={num_windows} produces ~"
+                    f"{first_window_duration + (num_windows - 1) * continuation_duration:.1f}s, "
+                    f"less than duration {duration}s; need at least {min_windows} windows"
+                )
 
     # What the concatenated latent actually decodes to.
     total_num_frames = MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(
@@ -2296,10 +2320,11 @@ class MiniMaxH3Pipeline(
         if ref_blocks is not None or task == "ref2va":
             # The Ref2VA block packer is N-frame generic and emits both
             # ``update_mask`` and ``audio_update_mask``, so continuation windows
-            # (any original task) route through it by passing ``ref_blocks`` —
-            # a ``video_audio`` history block carries the previous window's tail
-            # as frozen conditioning while the original task's transformer is
-            # still selected by the caller via ``task``.
+            # (any original task) route through it by passing ``ref_blocks``:
+            # a handoff image block plus a tail-audio ref block carry the
+            # previous window's tail as frozen conditioning. Single-window
+            # user requests still take the strict keyframe / ref2va layout
+            # selected by ``task`` in ``_prepare_request_inputs``.
             if ref_blocks is None:
                 if visual_condition_shape is None or ref_audio_t is None:
                     raise ValueError("ref2va condition metadata is missing")
