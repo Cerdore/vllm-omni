@@ -610,22 +610,33 @@ def _run_fake_windowed(
     )
     calls: dict[str, list] = {"encode_prompt": [], "build": [], "encode_image": [], "step_rows": [], "decode": []}
 
-    def encode_prompt(*, task, prompt, images=None):
-        calls["encode_prompt"].append((task, [img.getpixel((0, 0))[0] for img in (images or [])]))
+    def encode_prompt(*, task, prompt, images=None, prepared_videos=None, condition_labels=None):
+        calls["encode_prompt"].append((task, [img.getpixel((0, 0))[0] for img in (images or [])], condition_labels))
         n = 24 + 100 * len(images or [])
         return torch.zeros(n, 8), torch.ones(n, dtype=torch.long)
 
     def build(**kw):
         target_rows = kw["latent_t"] * _FAKE_FRAME_ROWS
+        # When ref_blocks is set (Ref2VA packer path), the packer adds
+        # ref audio + ref visual rows to audio_pos and img_pos.
+        ref_audio_extra = 0
+        if kw.get("ref_blocks"):
+            ref_audio_extra = sum(
+                b.get("ref_audio_t", 0) * 2 for b in kw["ref_blocks"] if b["kind"] in ("audio", "video_audio")
+            )
+        n_audio = kw["audio_t"] * 2 + ref_audio_extra
+        audio_update_mask = torch.ones(n_audio, dtype=torch.bool)
+        if ref_audio_extra:
+            audio_update_mask[:ref_audio_extra] = False
         branch = SimpleNamespace(
             update_mask_dev=torch.ones(target_rows, dtype=torch.bool),
-            audio_update_mask_dev=torch.ones(2 * kw["audio_t"], dtype=torch.bool),
-            audio_update_mask=torch.ones(2 * kw["audio_t"], dtype=torch.bool),
+            audio_update_mask_dev=audio_update_mask,
+            audio_update_mask=audio_update_mask,
         )
         inputs: dict[str, Any] = {
             "branch": branch,
             "video_rows": torch.zeros(target_rows, 96),
-            "audio_rows": torch.zeros(2 * kw["audio_t"], 32),
+            "audio_rows": torch.zeros(n_audio, 32),
             "audio_anchor": None,
         }
         calls["build"].append((kw, inputs))
@@ -637,7 +648,7 @@ def _run_fake_windowed(
         # temporal index (latent t has the constant value t / 10) so the held
         # slice is identifiable.
         rows = torch.full((int(inputs["branch"].update_mask_dev.shape[0]), 96), 7.0)
-        audio_rows = torch.full((2 * audio_t, 32), 7.0)
+        audio_rows = torch.full((int(inputs["audio_rows"].shape[0]), 32), 7.0)
         if on_step is not None:
             on_step(0, rows, audio_rows)
         calls["step_rows"].append((rows, audio_rows))
@@ -726,7 +737,7 @@ def test_generate_windowed_t2va_hands_off_frame_306_as_a_first_frame_request():
     plan, calls, video, audio = _run_fake_windowed(task="t2va", keyframes=None, image_values=[])
     # Window 0 keeps the request text (no re-encode); window 1 is a first-frame
     # fl2va request around the decoded handoff frame 306 (pixel 0.306 -> 78).
-    assert calls["encode_prompt"] == [("fl2va", [78])]
+    assert calls["encode_prompt"] == [("ref2va", [78], [("image", 1), ("audio", 1)])]
     assert calls["encode_image"] == [(78, (_FAKE_WIDTH, _FAKE_HEIGHT))]
     kw0, _ = calls["build"][0]
     kw1, inputs1 = calls["build"][1]
@@ -735,13 +746,14 @@ def test_generate_windowed_t2va_hands_off_frame_306_as_a_first_frame_request():
     # The text each window denoises with is the text encoded for that window:
     # the request's 24 tokens for window 0, the one-picture fl2va encoding after.
     assert _text_len(kw0) == 24 and _text_len(kw1) == 124
-    assert kw1["keyframe_frame_indices"] == [0]
+    assert kw1["keyframe_frame_indices"] is None  # Ref2VA packer, no keyframe cond
+    assert kw1["ref_blocks"] is not None  # routed through Ref2VA packer
     assert kw1["visual_condition_shapes"] == [(1, _FAKE_LATENT_H, _FAKE_LATENT_W)]
     assert bool((kw1["visual_condition"] == 78.0).all())
     assert kw1["num_frames"] == plan.window_num_frames and kw1["latent_t"] == plan.window_latent_t
-    # No audio rows are pinned or conditioned: full audio_t for every window.
-    assert bool(inputs1["branch"].audio_update_mask_dev.all()) and inputs1["audio_anchor"] is None
-    assert kw1["audio_t"] == plan.window_audio_t
+    # Audio condition is the handoff audio (Ref2VA packer path).
+    assert kw1["audio_condition"] is not None
+    assert kw1["audio_condition_lengths"] is not None
     # The first two latents of the shared span (window 0's latents 90 and 91 of
     # 107, valued 9.0 and 9.1) are held in window 1's leading target rows at the
     # step's sigma over the window's initial noise (zeros here); window 0 and
@@ -759,10 +771,15 @@ def test_generate_windowed_t2va_hands_off_frame_306_as_a_first_frame_request():
     assert bool((rows1[2 * _FAKE_FRAME_ROWS :] == 7.0).all())
     # The first 0.5 s (20 latents) of the span's audio is held too, in BOTH
     # channel blocks (channel-major rows); the fake tail and noise are zeros.
+    # With Ref2VA packer, the audio rows include ref audio rows (frozen, at
+    # the front); the held target rows are within the target portion.
     wa = plan.window_audio_t
-    held_audio = torch.cat([audio1[:20], audio1[wa : wa + 20]])
-    assert bool((held_audio == 0.0).all())
-    assert bool((audio1[20:wa] == 7.0).all()) and bool((audio1[wa + 20 :] == 7.0).all())
+    # Ref audio rows precede target audio rows in the Ref2VA layout.
+    ref_audio_rows = 80 * 2  # handoff_audio_t * 2
+    held_audio = torch.cat([audio1[ref_audio_rows : ref_audio_rows + 20], audio1[ref_audio_rows + wa : ref_audio_rows + wa + 20]])
+    assert bool((held_audio == 0.0).all()), "held audio should be zeros"
+    assert bool((audio1[ref_audio_rows + 20 : ref_audio_rows + wa] == 7.0).all()), "non-held target ch0 should be 7.0"
+    assert bool((audio1[ref_audio_rows + wa + 20 :] == 7.0).all()), "non-held target ch1 should be 7.0"
     # Output: 362 + 306 frames; audio 15.075 s + (15.075 - 2.325) s.
     assert video.shape[2] == plan.total_num_frames == 668
     assert audio.shape[-1] == (2 * plan.window_audio_t - plan.overlap_audio_t) * 800
@@ -797,13 +814,15 @@ def test_generate_windowed_fl2va_keeps_user_keyframes_paired_with_their_text():
     # [0, -1]: window 0 anchors image 0 only (re-encoded with only that
     # picture); the final window anchors [handoff, image -1] in that order.
     _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[0, -1], image_values=[10, 20])
-    assert calls["encode_prompt"] == [("fl2va", [10]), ("fl2va", [78, 20])]
+    assert calls["encode_prompt"] == [("fl2va", [10], None), ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)])]
     kw0, _ = calls["build"][0]
     kw1, _ = calls["build"][1]
     assert _text_len(kw0) == 124 and _text_len(kw1) == 224
     assert kw0["keyframe_frame_indices"] == [0]
     assert bool((kw0["visual_condition"] == 10.0).all()) and kw0["visual_condition"].shape[0] == _FAKE_FRAME_ROWS
-    assert kw1["keyframe_frame_indices"] == [0, -1]
+    assert kw1["keyframe_frame_indices"] is None  # Ref2VA packer, no keyframe cond
+    assert kw1["ref_blocks"] is not None  # routed through Ref2VA packer
+    assert len(kw1["ref_blocks"]) == 3  # handoff image + handoff audio + keyframe image
     assert kw1["visual_condition_shapes"] == [(1, _FAKE_LATENT_H, _FAKE_LATENT_W)] * 2
     assert bool((kw1["visual_condition"][:_FAKE_FRAME_ROWS] == 78.0).all())
     assert bool((kw1["visual_condition"][_FAKE_FRAME_ROWS:] == 20.0).all())
@@ -811,7 +830,7 @@ def test_generate_windowed_fl2va_keeps_user_keyframes_paired_with_their_text():
     # [-1] only: window 0 becomes a plain t2va window; the last frame moves to
     # the final window behind the handoff still.
     _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[-1], image_values=[20])
-    assert calls["encode_prompt"] == [("t2va", []), ("fl2va", [78, 20])]
+    assert calls["encode_prompt"] == [("t2va", [], None), ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)])]
     kw0, _ = calls["build"][0]
     kw1, _ = calls["build"][1]
     assert kw0["keyframe_frame_indices"] is None and kw0["visual_condition"] is None
@@ -819,7 +838,7 @@ def test_generate_windowed_fl2va_keeps_user_keyframes_paired_with_their_text():
 
     # [0] only: window 0 is exactly the request; window 1 anchors the handoff.
     _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[0], image_values=[10])
-    assert calls["encode_prompt"] == [("fl2va", [78])]
+    assert calls["encode_prompt"] == [("ref2va", [78], [("image", 1), ("audio", 1)])]
     kw0, _ = calls["build"][0]
     kw1, _ = calls["build"][1]
     assert kw0["keyframe_frame_indices"] == [0] and bool((kw0["visual_condition"] == 10.0).all())
@@ -832,7 +851,7 @@ def test_generate_windowed_three_windows_chain_handoffs_and_fades():
     # Each continuation hands off frame 306 of its predecessor and is a
     # first-frame fl2va request; the window before it has already been
     # blended once, and the splice still fits (contribution >= overlap).
-    assert calls["encode_prompt"] == [("fl2va", [78]), ("fl2va", [78])]
+    assert calls["encode_prompt"] == [("ref2va", [78], [("image", 1), ("audio", 1)]), ("ref2va", [78], [("image", 1), ("audio", 1)])]
     assert [kw["seed"] for kw, _ in calls["build"]] == [7, 8, 9]
     assert video.shape[2] == plan.total_num_frames == 362 + 2 * 306 == 974
     assert audio.shape[-1] == (3 * plan.window_audio_t - 2 * plan.overlap_audio_t) * 800
@@ -883,9 +902,13 @@ def test_generate_windowed_smallest_overlap_hands_over_at_the_held_frames():
     _, (rows1, audio1) = calls["step_rows"]
     assert bool((rows1[2 * _FAKE_FRAME_ROWS :] == 7.0).all()) and bool((rows1[: 2 * _FAKE_FRAME_ROWS] != 7.0).all())
     # The audio hold clamps to the 8-latent audio overlap, in both channel blocks.
+    # With Ref2VA packer, ref audio rows (frozen) precede target audio rows.
     wa = plan.window_audio_t
-    assert bool((audio1[:8] == 0.0).all()) and bool((audio1[8:wa] == 7.0).all())
-    assert bool((audio1[wa : wa + 8] == 0.0).all()) and bool((audio1[wa + 8 :] == 7.0).all())
+    ref_rows = 80 * 2  # handoff_audio_t * 2
+    assert bool((audio1[ref_rows : ref_rows + 8] == 0.0).all()), "held ch0 should be 0"
+    assert bool((audio1[ref_rows + 8 : ref_rows + wa] == 7.0).all()), "non-held ch0 should be 7"
+    assert bool((audio1[ref_rows + wa : ref_rows + wa + 8] == 0.0).all()), "held ch1 should be 0"
+    assert bool((audio1[ref_rows + wa + 8 :] == 7.0).all()), "non-held ch1 should be 7"
     torch.testing.assert_close(video[0, 0, :362, 0, 0], torch.arange(362, dtype=torch.float32) / 1000)
     assert round(float(video[0, 0, 362, 0, 0]) * 1000) == 5
     span_start = (plan.window_audio_t - plan.overlap_audio_t) * 800
@@ -987,3 +1010,219 @@ def test_generate_windowed_requires_a_local_text_encoder():
 
     with pytest.raises(OmniClientError):
         _run_fake_windowed(task="t2va", keyframes=None, image_values=[], text_encoder=None)
+
+
+# --------------------------------------------------------------------------- #
+# ref2va continuation: ref_blocks order, audio prepend, label shift
+# --------------------------------------------------------------------------- #
+def test_ref2va_continuation_prepends_handoff_blocks_and_shifts_labels():
+    """ref2va continuation window must:
+    1. prepend [handoff_image, handoff_audio] before the user's original ref_blocks
+    2. prepend handoff_audio_t to cond_audio_lengths
+    3. set cond_ref_audio_t=None (ref_blocks carries audio, not the legacy slot)
+    4. set cond_keyframes=None (no keyframe cond; all conditioning is in ref_blocks)
+    5. re-encode text in ref2va format with image ordinals shifted +1
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+        _resolve_minimax_h3_windowing,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_SHAPE_PLANNER
+
+    plan = _resolve_minimax_h3_windowing(duration=30.0, fps=24, num_segments=None, overlap_frames=None, window_duration=None)
+    calls: dict[str, list] = {"encode_prompt": [], "build": [], "encode_image": [], "step_rows": [], "decode": []}
+
+    def encode_prompt(*, task, prompt, images=None, prepared_videos=None, condition_labels=None):
+        calls["encode_prompt"].append((task, condition_labels))
+        n = 24 + 100 * len(images or [])
+        return torch.zeros(n, 8), torch.ones(n, dtype=torch.long)
+
+    def build(**kw):
+        target_rows = kw["latent_t"] * _FAKE_FRAME_ROWS
+        n_audio = kw["audio_t"] * 2
+        if kw.get("ref_blocks"):
+            ref_audio_rows = sum(
+                b["ref_audio_t"] * 2 for b in kw["ref_blocks"] if b["kind"] == "audio"
+            )
+            n_audio += ref_audio_rows
+        branch = SimpleNamespace(
+            update_mask_dev=torch.ones(target_rows, dtype=torch.bool),
+            audio_update_mask_dev=torch.ones(n_audio, dtype=torch.bool),
+            audio_update_mask=torch.ones(n_audio, dtype=torch.bool),
+        )
+        inputs = {
+            "branch": branch,
+            "video_rows": torch.zeros(target_rows, 96),
+            "audio_rows": torch.zeros(n_audio, 32),
+            "audio_anchor": None,
+        }
+        calls["build"].append((kw, inputs))
+        return inputs
+
+    def run_window_denoise(*, inputs, transformer, latent_t, latent_h, latent_w, audio_t, on_step=None):
+        rows = torch.full((int(inputs["branch"].update_mask_dev.shape[0]), 96), 7.0)
+        audio_rows = torch.full((2 * audio_t, 32), 7.0)
+        if on_step is not None:
+            on_step(0, rows, audio_rows)
+        calls["step_rows"].append((rows, audio_rows))
+        latent = (torch.arange(latent_t, dtype=torch.float32) / 10).view(1, 1, latent_t, 1, 1)
+        return latent.expand(1, 24, latent_t, latent_h, latent_w).clone(), torch.zeros(2, 32, audio_t)
+
+    def decode(video_latent, audio_latent, *, height, width):
+        frames = MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(int(video_latent.shape[2]))
+        video = torch.arange(frames, dtype=torch.float32).div(1000).view(1, 1, frames, 1, 1)
+        calls["decode"].append(frames)
+        audio = torch.full((1, 2, int(audio_latent.shape[2]) * 800), 1.0)
+        return video.expand(1, 3, frames, height, width).clone(), audio
+
+    def encode_image(image):
+        calls["encode_image"].append((image.getpixel((0, 0))[0], image.size))
+        return torch.full((_FAKE_FRAME_ROWS, 96), float(image.getpixel((0, 0))[0]))
+
+    from contextlib import contextmanager
+    @contextmanager
+    def ctx(*a, **k):
+        yield SimpleNamespace(update=lambda: None)
+
+    transformer = object()
+    fake = SimpleNamespace(
+        text_encoder=object(),
+        transformer=transformer,
+        _transformer_for_task=lambda task: transformer,
+        progress_bar=ctx,
+        _resident_dit_layers_on_device=ctx,
+        _component_on_device=ctx,
+        _build_denoise_inputs=build,
+        _run_window_denoise=run_window_denoise,
+        decode=decode,
+        video_vae=SimpleNamespace(encode_image=encode_image),
+        encode_prompt=encode_prompt,
+        device=torch.device("cpu"),
+    )
+
+    # Simulate a ref2va request with one image ref and one audio ref.
+    user_ref_blocks = [
+        {"kind": "image", "latent_h": _FAKE_LATENT_H, "latent_w": _FAKE_LATENT_W},
+        {"kind": "audio", "ref_audio_t": 80},
+    ]
+    user_audio_condition = torch.zeros(160, 32)
+    user_visual_condition = torch.full((_FAKE_FRAME_ROWS, 96), 42.0)
+    user_images = [_fake_image(42)]
+
+    video, audio = MiniMaxH3Pipeline._generate_windowed(
+        fake,
+        task="ref2va",
+        text_embeddings=torch.zeros(124, 8),
+        text_tags=torch.ones(124, dtype=torch.long),
+        seed=7,
+        latent_t=plan.window_latent_t,
+        latent_h=_FAKE_LATENT_H,
+        latent_w=_FAKE_LATENT_W,
+        audio_t=plan.window_audio_t,
+        num_frames=plan.window_num_frames,
+        num_steps=4,
+        video_shift=5.0,
+        audio_shift=3.0,
+        base_schedule=None,
+        visual_condition=user_visual_condition,
+        visual_condition_shape=None,
+        audio_condition=user_audio_condition,
+        ref_audio_t=80,
+        ref_blocks=user_ref_blocks,
+        visual_condition_shapes=[(1, _FAKE_LATENT_H, _FAKE_LATENT_W)],
+        audio_condition_lengths=[80],
+        keyframe_frame_indices=None,
+        windowing=plan,
+        prompt="a coast",
+        images=user_images,
+        height=_FAKE_HEIGHT,
+        width=_FAKE_WIDTH,
+        prepared_videos=None,
+        condition_labels=[("image", 1), ("audio", 1)],
+    )
+
+    # Window 0: no re-encode, keeps request text.
+    # Window 1: re-encoded with shifted labels.
+    assert len(calls["encode_prompt"]) == 1, "only window 1 should re-encode"
+    task_w1, labels_w1 = calls["encode_prompt"][0]
+    assert task_w1 == "ref2va"
+    # handoff still is image 1, handoff audio is audio 1, user image shifts to image 2, user audio stays audio 1
+    assert ("image", 1) in labels_w1
+    assert ("audio", 1) in labels_w1
+    assert ("image", 2) in labels_w1
+
+    kw1, _ = calls["build"][1]
+    # ref_blocks: [handoff_image, handoff_audio, *user_ref_blocks]
+    assert kw1["ref_blocks"] is not None
+    assert len(kw1["ref_blocks"]) == 4
+    assert kw1["ref_blocks"][0]["kind"] == "image"
+    assert kw1["ref_blocks"][1]["kind"] == "audio"
+    assert kw1["ref_blocks"][2]["kind"] == "image"
+    assert kw1["ref_blocks"][3]["kind"] == "audio"
+    # cond_ref_audio_t is None (ref_blocks carries audio, not the legacy slot)
+    assert kw1["ref_audio_t"] is None
+    # cond_keyframes is None
+    assert kw1["keyframe_frame_indices"] is None
+    # cond_audio_lengths: [handoff_audio_t, *user_audio_lengths]
+    assert kw1["audio_condition_lengths"] is not None
+    assert kw1["audio_condition_lengths"][0] == 80  # handoff audio
+    assert kw1["audio_condition_lengths"][1] == 80  # user audio
+
+
+# --------------------------------------------------------------------------- #
+# FL2VA/T2VA continuation: routed through Ref2VA packer
+# --------------------------------------------------------------------------- #
+def test_fl2va_continuation_routes_through_ref2va_packer():
+    """FL2VA/T2VA continuation must route through the Ref2VA packer (not the
+    FL2VA packer) so the model sees a layout it was trained on.  This means:
+    1. cond_ref_blocks is not None (triggers Ref2VA packer path)
+    2. cond_keyframes is None (no keyframe cond)
+    3. cond_audio = handoff_audio_rows, cond_audio_lengths = [handoff_audio_t]
+    4. text re-encoded as ref2va with [image, audio] labels
+    """
+    plan, calls, _, _ = _run_fake_windowed(task="t2va", keyframes=None, image_values=[])
+
+    # Window 1 re-encodes as ref2va (not fl2va/t2va).
+    assert len(calls["encode_prompt"]) == 1
+    task_w1, images_w1, labels_w1 = calls["encode_prompt"][0]
+    assert task_w1 == "ref2va"
+    # handoff still is the only image; audio label is present
+    assert len(images_w1) == 1  # just the handoff image value
+
+    kw1, _ = calls["build"][1]
+    # ref_blocks is not None -> triggers Ref2VA packer in _build_denoise_inputs
+    assert kw1["ref_blocks"] is not None
+    assert len(kw1["ref_blocks"]) == 2
+    assert kw1["ref_blocks"][0]["kind"] == "image"
+    assert kw1["ref_blocks"][1]["kind"] == "audio"
+    # No keyframe cond
+    assert kw1["keyframe_frame_indices"] is None
+    # Audio condition is the handoff audio
+    assert kw1["audio_condition"] is not None
+    assert kw1["audio_condition_lengths"] is not None
+    assert kw1["audio_condition_lengths"][0] > 0
+    # ref_audio_t is None (not the legacy FL2VA packer slot)
+    assert kw1["ref_audio_t"] is None
+
+
+def test_fl2va_continuation_with_keyframe_adds_ref_image_blocks():
+    """When a FL2VA continuation window has user keyframes (e.g. last-frame),
+    those keyframes must become additional ref image blocks (not keyframe cond)."""
+    _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[0, -1], image_values=[10, 20])
+
+    # Window 1 (continuation): has the handoff + last-frame keyframe
+    kw1, _ = calls["build"][1]
+    assert kw1["ref_blocks"] is not None
+    # handoff image + handoff audio + keyframe image = 3 blocks
+    assert len(kw1["ref_blocks"]) == 3
+    assert kw1["ref_blocks"][0]["kind"] == "image"  # handoff still
+    assert kw1["ref_blocks"][1]["kind"] == "audio"  # handoff audio
+    assert kw1["ref_blocks"][2]["kind"] == "image"  # user keyframe
+    # No keyframe cond
+    assert kw1["keyframe_frame_indices"] is None
+    # Visual condition includes handoff + keyframe
+    assert kw1["visual_condition"] is not None
+    assert kw1["visual_condition_shapes"] is not None
+    assert len(kw1["visual_condition_shapes"]) == 2
