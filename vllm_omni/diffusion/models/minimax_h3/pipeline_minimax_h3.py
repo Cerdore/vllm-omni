@@ -282,9 +282,7 @@ def _resolve_minimax_h3_windowing(
     # falls off the VAE's 5n+2 grid or accumulates A/V desync per window.
     requested = int(overlap_frames) if overlap_frames is not None else MINIMAX_H3_DEFAULT_OVERLAP_FRAMES
     if overlap_frames is not None and requested <= 0:
-        raise OmniClientError(
-            f"MiniMax H3 overlap_frames must be positive, got {requested}"
-        )
+        raise OmniClientError(f"MiniMax H3 overlap_frames must be positive, got {requested}")
     if requested >= window_num_frames:
         raise OmniClientError(
             f"MiniMax H3 overlap_frames {requested} must be smaller than the window {window_num_frames} frames"
@@ -328,9 +326,7 @@ def _resolve_minimax_h3_windowing(
                     f"MiniMax H3 duration {duration}s fits in a single window "
                     f"({first_window_duration:.1f}s); set num_segments=1 or increase duration"
                 )
-            min_windows = 1 + max(
-                0, math.ceil((duration - first_window_duration) / continuation_duration)
-            )
+            min_windows = 1 + max(0, math.ceil((duration - first_window_duration) / continuation_duration))
             if num_windows < min_windows:
                 raise OmniClientError(
                     f"MiniMax H3 num_segments={num_windows} produces ~"
