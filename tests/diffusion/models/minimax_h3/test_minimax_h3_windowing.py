@@ -776,7 +776,9 @@ def test_generate_windowed_t2va_hands_off_frame_306_as_a_first_frame_request():
     wa = plan.window_audio_t
     # Ref audio rows precede target audio rows in the Ref2VA layout.
     ref_audio_rows = 80 * 2  # handoff_audio_t * 2
-    held_audio = torch.cat([audio1[ref_audio_rows : ref_audio_rows + 20], audio1[ref_audio_rows + wa : ref_audio_rows + wa + 20]])
+    held_audio = torch.cat(
+        [audio1[ref_audio_rows : ref_audio_rows + 20], audio1[ref_audio_rows + wa : ref_audio_rows + wa + 20]]
+    )
     assert bool((held_audio == 0.0).all()), "held audio should be zeros"
     assert bool((audio1[ref_audio_rows + 20 : ref_audio_rows + wa] == 7.0).all()), "non-held target ch0 should be 7.0"
     assert bool((audio1[ref_audio_rows + wa + 20 :] == 7.0).all()), "non-held target ch1 should be 7.0"
@@ -814,7 +816,10 @@ def test_generate_windowed_fl2va_keeps_user_keyframes_paired_with_their_text():
     # [0, -1]: window 0 anchors image 0 only (re-encoded with only that
     # picture); the final window anchors [handoff, image -1] in that order.
     _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[0, -1], image_values=[10, 20])
-    assert calls["encode_prompt"] == [("fl2va", [10], None), ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)])]
+    assert calls["encode_prompt"] == [
+        ("fl2va", [10], None),
+        ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)]),
+    ]
     kw0, _ = calls["build"][0]
     kw1, _ = calls["build"][1]
     assert _text_len(kw0) == 124 and _text_len(kw1) == 224
@@ -830,7 +835,10 @@ def test_generate_windowed_fl2va_keeps_user_keyframes_paired_with_their_text():
     # [-1] only: window 0 becomes a plain t2va window; the last frame moves to
     # the final window behind the handoff still.
     _, calls, _, _ = _run_fake_windowed(task="fl2va", keyframes=[-1], image_values=[20])
-    assert calls["encode_prompt"] == [("t2va", [], None), ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)])]
+    assert calls["encode_prompt"] == [
+        ("t2va", [], None),
+        ("ref2va", [78, 20], [("image", 1), ("audio", 1), ("image", 2)]),
+    ]
     kw0, _ = calls["build"][0]
     kw1, _ = calls["build"][1]
     assert kw0["keyframe_frame_indices"] is None and kw0["visual_condition"] is None
@@ -851,7 +859,10 @@ def test_generate_windowed_three_windows_chain_handoffs_and_fades():
     # Each continuation hands off frame 306 of its predecessor and is a
     # first-frame fl2va request; the window before it has already been
     # blended once, and the splice still fits (contribution >= overlap).
-    assert calls["encode_prompt"] == [("ref2va", [78], [("image", 1), ("audio", 1)]), ("ref2va", [78], [("image", 1), ("audio", 1)])]
+    assert calls["encode_prompt"] == [
+        ("ref2va", [78], [("image", 1), ("audio", 1)]),
+        ("ref2va", [78], [("image", 1), ("audio", 1)]),
+    ]
     assert [kw["seed"] for kw, _ in calls["build"]] == [7, 8, 9]
     assert video.shape[2] == plan.total_num_frames == 362 + 2 * 306 == 974
     assert audio.shape[-1] == (3 * plan.window_audio_t - 2 * plan.overlap_audio_t) * 800
@@ -1031,7 +1042,9 @@ def test_ref2va_continuation_prepends_handoff_blocks_and_shifts_labels():
     )
     from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_SHAPE_PLANNER
 
-    plan = _resolve_minimax_h3_windowing(duration=30.0, fps=24, num_segments=None, overlap_frames=None, window_duration=None)
+    plan = _resolve_minimax_h3_windowing(
+        duration=30.0, fps=24, num_segments=None, overlap_frames=None, window_duration=None
+    )
     calls: dict[str, list] = {"encode_prompt": [], "build": [], "encode_image": [], "step_rows": [], "decode": []}
 
     def encode_prompt(*, task, prompt, images=None, prepared_videos=None, condition_labels=None):
@@ -1043,9 +1056,7 @@ def test_ref2va_continuation_prepends_handoff_blocks_and_shifts_labels():
         target_rows = kw["latent_t"] * _FAKE_FRAME_ROWS
         n_audio = kw["audio_t"] * 2
         if kw.get("ref_blocks"):
-            ref_audio_rows = sum(
-                b["ref_audio_t"] * 2 for b in kw["ref_blocks"] if b["kind"] == "audio"
-            )
+            ref_audio_rows = sum(b["ref_audio_t"] * 2 for b in kw["ref_blocks"] if b["kind"] == "audio")
             n_audio += ref_audio_rows
         branch = SimpleNamespace(
             update_mask_dev=torch.ones(target_rows, dtype=torch.bool),
@@ -1082,6 +1093,7 @@ def test_ref2va_continuation_prepends_handoff_blocks_and_shifts_labels():
         return torch.full((_FAKE_FRAME_ROWS, 96), float(image.getpixel((0, 0))[0]))
 
     from contextlib import contextmanager
+
     @contextmanager
     def ctx(*a, **k):
         yield SimpleNamespace(update=lambda: None)
